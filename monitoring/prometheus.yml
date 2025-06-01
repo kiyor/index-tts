@@ -1,0 +1,38 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  # - "first_rules.yml"
+  # - "second_rules.yml"
+
+scrape_configs:
+  # Prometheus 自身监控
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # IndexTTS 应用监控
+  - job_name: 'indextts'
+    static_configs:
+      - targets: ['indextts:7860']
+    metrics_path: '/metrics'
+    scrape_interval: 30s
+    scrape_timeout: 10s
+
+  # Nginx 监控 (如果启用)
+  - job_name: 'nginx'
+    static_configs:
+      - targets: ['nginx:80']
+    metrics_path: '/health'
+    scrape_interval: 30s
+
+  # Docker 容器监控 (可选)
+  # - job_name: 'docker'
+  #   static_configs:
+  #     - targets: ['host.docker.internal:9323']
+
+  # GPU 监控 (如果有 nvidia-smi exporter)
+  # - job_name: 'gpu'
+  #   static_configs:
+  #     - targets: ['localhost:9445'] 

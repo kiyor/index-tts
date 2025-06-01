@@ -1,0 +1,113 @@
+version: '3.8'
+
+services:
+  indextts:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: indextts-webui
+    ports:
+      - "7860:7860"
+    volumes:
+      # 挂载模型目录 (只读)
+      - ./checkpoints:/app/checkpoints:ro
+      # 挂载输出目录 (读写)
+      - ./outputs:/app/outputs
+      # 挂载提示音频目录 (读写)
+      - ./prompts:/app/prompts
+      # 挂载测试数据 (只读)
+      - ./test_data:/app/test_data:ro
+      # 挂载日志目录
+      - ./logs:/app/logs
+    environment:
+      - CUDA_VISIBLE_DEVICES=0
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - PYTHONUNBUFFERED=1
+      - TZ=Asia/Shanghai
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+        limits:
+          memory: 8G
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7860/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+    networks:
+      - indextts-network
+
+  # 可选：Nginx 反向代理
+  nginx:
+    image: nginx:alpine
+    container_name: indextts-nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+      - ./nginx/logs:/var/log/nginx
+    depends_on:
+      - indextts
+    restart: unless-stopped
+    networks:
+      - indextts-network
+    profiles:
+      - with-nginx
+
+  # 可选：监控服务
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: indextts-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=200h'
+      - '--web.enable-lifecycle'
+    restart: unless-stopped
+    networks:
+      - indextts-network
+    profiles:
+      - with-monitoring
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: indextts-grafana
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin123
+      - GF_USERS_ALLOW_SIGN_UP=false
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+    networks:
+      - indextts-network
+    profiles:
+      - with-monitoring
+
+networks:
+  indextts-network:
+    driver: bridge
+
+volumes:
+  prometheus_data:
+  grafana_data: 

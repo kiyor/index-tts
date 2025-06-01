@@ -1,0 +1,115 @@
+# IndexTTS 项目规则
+
+## 项目简介
+IndexTTS 是一个工业级可控高效的零样本文本转语音系统，基于 GPT 风格的 TTS 模型。
+
+## 核心特性
+- 支持中文拼音纠音
+- 支持标点符号控制停顿
+- 基于 XTTS 和 Tortoise 改进
+- 集成 BigVGAN2 优化音频质量
+
+## 技术栈
+- Python 3.10
+- PyTorch + CUDA
+- Transformers
+- 音频处理：torchaudio, librosa
+- Web界面：gradio
+- 容器化：Docker + Docker Compose
+
+## 已解决问题
+1. **bitsandbytes CUDA 兼容性问题** ✅
+   - Tesla P4 GPU (计算能力 6.1) 与 CUDA 12.4 不兼容
+   - 解决方案：在 indextts/infer.py 中禁用 bitsandbytes 导入
+   - 代码：`sys.modules['bitsandbytes'] = None`
+
+2. **模型推理正常运行** ✅
+   - 标准推理模式：RTF ~1.5-1.8
+   - 快速推理模式：支持长文本批处理
+   - 支持中英文语音合成
+
+3. **WebUI 部署方案** ✅
+   - 本地启动：`python webui_fixed.py`
+   - Docker 部署：`./docker-start.sh`
+   - 支持 GPU 加速和监控
+
+## WebUI 启动方式
+
+### 本地启动 (推荐)
+```bash
+# 激活环境
+conda activate index-tts
+
+# 安装 WebUI 依赖
+pip install gradio pandas
+
+# 启动 WebUI
+python webui_fixed.py --host 0.0.0.0 --port 7860
+
+# 访问地址: http://localhost:7860
+```
+
+### Docker 部署
+```bash
+# 使用启动脚本 (推荐)
+chmod +x docker-start.sh
+./docker-start.sh
+
+# 手动启动
+docker-compose up -d
+
+# 访问地址: http://localhost:7860
+```
+
+## Docker 部署模式
+1. **基础模式**: 仅 IndexTTS WebUI
+2. **完整模式**: 包含 Nginx 反向代理
+3. **监控模式**: 包含 Prometheus + Grafana
+4. **全功能模式**: 包含所有服务
+
+## 常见问题
+1. **DeepSpeed 未安装** - 自动回退到标准推理
+2. **BigVGAN CUDA 内核** - 回退到 torch 实现
+3. **依赖冲突** - 建议使用 conda 环境隔离
+4. **端口冲突** - 修改 docker-compose.yml 中的端口映射
+5. **GPU 不工作** - 检查 NVIDIA Docker 安装
+
+## 项目结构
+- indextts/ - 核心推理代码
+- checkpoints/ - 模型文件 (必需)
+- webui_fixed.py - 修复版 WebUI
+- Dockerfile - Docker 镜像配置
+- docker-compose.yml - 容器编排配置
+- docker-start.sh - Docker 启动脚本
+- nginx/ - Nginx 配置
+- monitoring/ - 监控配置
+- outputs/ - 输出目录
+- prompts/ - 提示音频
+- logs/ - 日志文件
+- test_indextts.py - 完整测试脚本
+- DOCKER_USAGE.md - Docker 使用说明
+
+## 快速测试
+```bash
+# 基础功能测试
+conda activate index-tts
+python test_indextts.py
+
+# WebUI 测试
+python webui_fixed.py --help
+
+# Docker 测试
+./docker-start.sh
+```
+
+## 访问地址
+- **WebUI**: http://localhost:7860
+- **Nginx**: http://localhost:80 (完整模式)
+- **Prometheus**: http://localhost:9090 (监控模式)
+- **Grafana**: http://localhost:3000 (监控模式, admin/admin123)
+
+## 性能优化建议
+1. 使用 FP16 推理模式
+2. 调整批次大小和分句参数
+3. 使用 SSD 存储模型文件
+4. 配置适当的 GPU 内存限制 
