@@ -20,6 +20,7 @@ sentencepiece
 librosa
 gradio
 tqdm
+deepspeed>=0.12.0
 
 WeTextProcessing; platform_machine != "Darwin"
 wetext; platform_system == "Darwin"

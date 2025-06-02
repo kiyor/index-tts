@@ -1,12 +1,12 @@
 #!/bin/bash
 
-# IndexTTS Docker 启动脚本
-# 支持 GPU 的 Docker 部署
+# IndexTTS Docker 启动脚本 (统一版本)
+# 支持 GPU 的 Docker 部署，包含 demos 音频库功能
 
 set -e
 
-echo "🐳 IndexTTS Docker 启动脚本"
-echo "================================"
+echo "🐳 IndexTTS Docker 启动脚本 (统一版本)"
+echo "========================================"
 
 # 检查 Docker 是否安装
 if ! command -v docker &> /dev/null; then
@@ -57,16 +57,25 @@ fi
 
 echo "✅ 模型文件检查通过"
 
+# 检查 demos 目录
+if [ -d "demos" ]; then
+    demo_count=$(find demos -name "*.wav" 2>/dev/null | wc -l)
+    echo "✅ 检测到 demos 目录，包含 $demo_count 个音频文件"
+else
+    echo "⚠️  demos 目录不存在，将创建空目录"
+    mkdir -p demos
+fi
+
 # 创建必要的目录
-mkdir -p outputs prompts logs nginx/logs monitoring
+mkdir -p outputs prompts logs nginx/logs monitoring demos
 
 # 设置权限
-chmod -R 755 outputs prompts logs
+chmod -R 755 outputs prompts logs demos
 
 # 选择启动模式
 echo ""
 echo "请选择启动模式:"
-echo "1) 基础模式 (仅 IndexTTS WebUI)"
+echo "1) 基础模式 (仅 IndexTTS WebUI 统一版本)"
 echo "2) 完整模式 (包含 Nginx 反向代理)"
 echo "3) 监控模式 (包含 Prometheus + Grafana)"
 echo "4) 全功能模式 (包含所有服务)"
@@ -75,7 +84,7 @@ read -p "请输入选择 (1-4): " choice
 
 case $choice in
     1)
-        echo "🚀 启动基础模式..."
+        echo "🚀 启动基础模式 (统一WebUI)..."
         COMPOSE_PROFILES=""
         ;;
     2)
@@ -129,10 +138,15 @@ else
 fi
 
 echo ""
-echo "🎉 IndexTTS 启动完成！"
+echo "🎉 IndexTTS 统一版本启动完成！"
 echo ""
 echo "📱 访问地址:"
-echo "   - WebUI: http://localhost:7860"
+echo "   - WebUI (统一版本): http://localhost:7860"
+echo ""
+echo "🎭 WebUI 功能标签页:"
+echo "   - 🎵 音频生成: 主要TTS功能 + 预设音频库选择"
+echo "   - 🎭 音频库管理: 查看demos音频库统计和结构"
+echo "   - ℹ️ 系统信息: 查看系统状态、模型信息、修复状态"
 
 if [[ "$COMPOSE_PROFILES" == *"with-nginx"* ]]; then
     echo "   - Nginx: http://localhost:80"
@@ -154,5 +168,6 @@ echo "🔧 故障排除:"
 echo "   - 如果无法访问，请检查防火墙设置"
 echo "   - 如果 GPU 不工作，请检查 NVIDIA Docker 安装"
 echo "   - 查看详细日志: docker-compose logs indextts"
+echo "   - demos音频不显示: 检查demos目录结构和WAV文件"
 echo ""
 echo "⏹️  按 Ctrl+C 停止所有服务" 

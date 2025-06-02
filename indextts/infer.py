@@ -84,17 +84,44 @@ class IndexTTS:
         else:
             self.gpt.eval()
         print(">> GPT weights restored from:", self.gpt_path)
-        if self.is_fp16:
+        if torch.cuda.is_available():
             try:
                 import deepspeed
-
                 use_deepspeed = True
             except (ImportError, OSError, CalledProcessError) as e:
                 use_deepspeed = False
                 print(f">> DeepSpeed加载失败，回退到标准推理: {e}")
                 print("See more details https://www.deepspeed.ai/tutorials/advanced-install/")
 
-            self.gpt.post_init_gpt2_config(use_deepspeed=use_deepspeed, kv_cache=True, half=True)
+            # 智能检测 GPU 是否支持 FP16
+            supports_fp16 = False
+            if torch.cuda.is_available():
+                gpu_name = torch.cuda.get_device_name(0)
+                compute_capability = torch.cuda.get_device_capability(0)
+                
+                # 检查计算能力：7.0+ 支持 Tensor Cores 和 FP16
+                # Tesla P4 是 6.1，不支持 FP16 推理优化
+                if compute_capability[0] >= 7 or (compute_capability[0] == 6 and compute_capability[1] >= 1):
+                    # 进一步检查是否真的支持 FP16
+                    try:
+                        # 简单测试 FP16 运算
+                        test_tensor = torch.randn(10, 10, device=self.device, dtype=torch.float16)
+                        test_result = torch.matmul(test_tensor, test_tensor)
+                        supports_fp16 = True
+                        print(f">> GPU {gpu_name} (计算能力 {compute_capability[0]}.{compute_capability[1]}) 支持 FP16")
+                    except Exception as e:
+                        supports_fp16 = False
+                        print(f">> GPU {gpu_name} FP16 测试失败: {e}")
+                else:
+                    print(f">> GPU {gpu_name} (计算能力 {compute_capability[0]}.{compute_capability[1]}) 不支持 FP16，使用 FP32")
+                
+                # 对于特定的已知不支持 FP16 的 GPU
+                unsupported_gpus = ["Tesla P4", "Tesla K", "GTX 9", "GTX 10"]
+                if any(unsupported in gpu_name for unsupported in unsupported_gpus):
+                    supports_fp16 = False
+                    print(f">> 检测到 {gpu_name}，强制使用 FP32 以确保兼容性")
+
+            self.gpt.post_init_gpt2_config(use_deepspeed=use_deepspeed, kv_cache=True, half=supports_fp16)
         else:
             self.gpt.post_init_gpt2_config(use_deepspeed=False, kv_cache=True, half=False)
 

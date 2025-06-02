@@ -1,8 +1,8 @@
-# IndexTTS Docker 部署指南
+# IndexTTS Docker 部署指南 (统一版本)
 
 ## 🐳 Docker 部署方案
 
-IndexTTS 现在支持完整的 Docker 部署，包含 GPU 支持、Nginx 反向代理和监控系统。
+IndexTTS 现在支持完整的 Docker 部署，包含统一 WebUI、GPU 支持、demos 音频库、Nginx 反向代理和监控系统。
 
 ## 📋 前置要求
 
@@ -53,12 +53,13 @@ chmod +x docker-start.sh
 启动脚本会自动：
 - 检查 Docker 和 NVIDIA Docker 支持
 - 验证模型文件完整性
+- 检查 demos 音频库
 - 提供多种部署模式选择
 - 自动构建和启动服务
 
 ### 方法二：手动启动
 ```bash
-# 基础模式 (仅 WebUI)
+# 基础模式 (仅统一 WebUI)
 docker-compose up -d
 
 # 包含 Nginx 反向代理
@@ -78,13 +79,18 @@ index-tts/
 ├── Dockerfile                 # 主 Dockerfile
 ├── docker-compose.yml         # Docker Compose 配置
 ├── .dockerignore              # Docker 忽略文件
-├── docker-start.sh            # 启动脚本
-├── webui_fixed.py             # 修复版 WebUI
+├── docker-start.sh            # 启动脚本 (统一版本)
+├── webui.py                   # 统一 WebUI (包含所有功能)
 ├── checkpoints/               # 模型文件 (必需)
 │   ├── bigvgan_generator.pth
 │   ├── bpe.model
 │   ├── gpt.pth
 │   └── config.yaml
+├── demos/                     # 预设音频库 (可选)
+│   ├── 男声/中文/
+│   ├── 女声/英文/
+│   ├── 动漫角色/
+│   └── 游戏角色/原神/
 ├── outputs/                   # 输出目录
 ├── prompts/                   # 提示音频
 ├── logs/                      # 日志文件
@@ -95,10 +101,30 @@ index-tts/
     └── prometheus.yml
 ```
 
+## 🎭 WebUI 功能
+
+### 统一界面标签页
+1. **🎵 音频生成**
+   - 主要 TTS 功能
+   - 预设音频库选择
+   - 上传/录音功能
+   - 高级参数设置
+
+2. **🎭 音频库管理**
+   - demos 目录统计
+   - 音频库结构查看
+   - 使用指南
+
+3. **ℹ️ 系统信息**
+   - 系统状态监控
+   - 模型信息
+   - 修复状态
+   - 启动参数
+
 ## 🌐 访问地址
 
 ### 基础模式
-- **WebUI**: http://localhost:7860
+- **WebUI (统一版本)**: http://localhost:7860
 
 ### 完整模式 (包含 Nginx)
 - **WebUI**: http://localhost:7860
@@ -139,6 +165,9 @@ docker stats
 
 # 查看 GPU 使用情况
 docker-compose exec indextts nvidia-smi
+
+# 检查 demos 音频库
+docker-compose exec indextts find demos -name "*.wav" | wc -l
 ```
 
 ### 镜像管理
@@ -193,7 +222,19 @@ docker-compose exec indextts nvidia-smi
 docker-compose exec indextts python -c "import torch; print(torch.cuda.is_available())"
 ```
 
-### 2. 端口冲突
+### 2. demos 音频不显示
+```bash
+# 检查 demos 目录挂载
+docker-compose exec indextts ls -la demos/
+
+# 检查音频文件
+docker-compose exec indextts find demos -name "*.wav"
+
+# 检查目录权限
+ls -la demos/
+```
+
+### 3. 端口冲突
 ```bash
 # 检查端口占用
 sudo netstat -tlnp | grep :7860
@@ -203,7 +244,7 @@ ports:
   - "8860:7860"  # 改为 8860
 ```
 
-### 3. 内存不足
+### 4. 内存不足
 ```bash
 # 增加内存限制 (在 docker-compose.yml 中)
 deploy:
@@ -212,7 +253,7 @@ deploy:
       memory: 16G  # 增加到 16GB
 ```
 
-### 4. 模型文件问题
+### 5. 模型文件问题
 ```bash
 # 检查模型文件
 ls -la checkpoints/
@@ -221,7 +262,7 @@ ls -la checkpoints/
 # 参考 README.md 中的模型下载说明
 ```
 
-### 5. 网络问题
+### 6. 网络问题
 ```bash
 # 检查 Docker 网络
 docker network ls
