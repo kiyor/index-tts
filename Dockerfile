@@ -1,4 +1,4 @@
-# IndexTTS Dockerfile with GPU support
+# IndexTTS Dockerfile with GPU support and optimizations
 FROM nvidia/cuda:12.9.0-devel-ubuntu22.04
 
 # 设置环境变量
@@ -53,73 +53,57 @@ USER indextts
 # 升级 pip
 RUN python3 -m pip install --user --upgrade pip
 
-# 第一层：复制依赖配置文件 (变动频率最低)
+# 复制依赖配置文件
 COPY --chown=indextts:indextts requirements.txt setup.py pyproject.toml MANIFEST.in ./
+
+# 复制必要的文档文件 (setup.py 需要)
+COPY --chown=indextts:indextts README.md LICENSE DISCLAIMER INDEX_MODEL_LICENSE ./
 
 # 安装 PyTorch (CUDA 12.x 兼容)
 RUN python3 -m pip install --user torch torchaudio --index-url https://download.pytorch.org/whl/cu121
 
-# 手动安装依赖
-RUN python3 -m pip install --user \
-    WeTextProcessing \
-    accelerate \
-    "einops==0.8.1" \
-    librosa \
-    "matplotlib==3.8.2" \
-    "numpy<2" \
-    omegaconf \
-    sentencepiece \
-    "tokenizers==0.15.0" \
-    "transformers==4.36.2"
+# 安装基础依赖 (包括 DeepSpeed)
+RUN python3 -m pip install --user -r requirements.txt
 
 # 安装 WebUI 依赖
 RUN python3 -m pip install --user gradio pandas
 
-# 第二层：复制核心代码目录 (变动频率中等)
+# 复制核心代码
 COPY --chown=indextts:indextts indextts/ ./indextts/
 COPY --chown=indextts:indextts tools/ ./tools/
 
-# 安装项目依赖 (跳过编译扩展)
-RUN python3 -m pip install --user -e . --no-build-isolation --no-deps || true
+# 强制重新编译 CUDA 扩展
+RUN echo "🔧 强制重新编译 CUDA 扩展..." && \
+    python3 -m pip install --user -e . --no-deps --no-build-isolation --force-reinstall
 
-# 复制预构建的 CUDA 扩展
-COPY --chown=indextts:indextts docker_assets/ ./docker_assets/
-
-# 安装预构建的 CUDA 扩展
-RUN echo "🔧 安装预构建的 CUDA 扩展..." && \
-    python3 docker_assets/install_cuda_extensions.py 2>&1 | tee install_cuda.log || echo "⚠️  CUDA扩展安装失败，将在运行时编译"
-
-# 第三层：复制测试和资源文件 (变动频率中等)
+# 复制其他文件
 COPY --chown=indextts:indextts tests/ ./tests/
 COPY --chown=indextts:indextts assets/ ./assets/
 COPY --chown=indextts:indextts test_data/ ./test_data/
-
-# 第四层：复制配置和文档文件 (变动频率较高)
 COPY --chown=indextts:indextts *.md ./
-COPY --chown=indextts:indextts LICENSE DISCLAIMER INDEX_MODEL_LICENSE ./
-
-# 第五层：复制应用入口文件 (变动频率最高)
 COPY --chown=indextts:indextts webui.py test_indextts.py create_test_audio.py fix_bitsandbytes.py ./
 
-# 创建必要的目录 (这些目录将通过挂载提供，不复制内容)
+# 创建必要的目录
 RUN mkdir -p /app/outputs /app/prompts /app/demos /app/logs /app/checkpoints
 
 # 创建启动脚本
 RUN echo '#!/bin/bash\n\
-echo "🚀 启动 IndexTTS WebUI (统一版本)..."\n\
+echo "🚀 启动 IndexTTS WebUI (优化版本)..."\n\
 echo "📍 工作目录: $(pwd)"\n\
 echo "🐍 Python 版本: $(python3 --version)"\n\
 echo "🔧 CUDA 版本: $(nvcc --version | grep release || echo \"CUDA not available\")"\n\
 echo "💾 GPU 信息:"\n\
 nvidia-smi --query-gpu=name,memory.total,memory.used --format=csv,noheader,nounits 2>/dev/null || echo "  GPU 信息不可用"\n\
 echo ""\n\
+echo "📦 检查 DeepSpeed:"\n\
+python3 -c "import deepspeed; print(f\"  ✅ DeepSpeed {deepspeed.__version__} 已安装\")" 2>/dev/null || echo "  ❌ DeepSpeed 未安装"\n\
+echo "🔧 检查 BigVGAN CUDA 扩展:"\n\
+python3 -c "from indextts.BigVGAN.alias_free_activation import Activation1d; print(\"  ✅ BigVGAN CUDA 扩展正常\")" 2>/dev/null || echo "  ⚠️ BigVGAN CUDA 扩展回退到 torch"\n\
+echo ""\n\
 echo "📁 检查目录结构:"\n\
 echo "  - checkpoints: $(ls -la checkpoints 2>/dev/null | wc -l) 个文件"\n\
 echo "  - demos: $(find demos -name \*.wav 2>/dev/null | wc -l) 个音频文件"\n\
 echo "  - outputs: $(ls -la outputs 2>/dev/null | wc -l) 个文件"\n\
-echo ""\n\
-echo "🔧 检查 CUDA 扩展缓存:"\n\
-python3 -c "import torch; cache_dir = torch.utils.cpp_extension._get_build_directory(\"\", verbose=False); import os; print(f\"  - 缓存目录: {cache_dir}\"); print(f\"  - 缓存文件: {len(os.listdir(cache_dir)) if os.path.exists(cache_dir) else 0} 个\")" 2>/dev/null || echo "  - 缓存检查失败"\n\
 echo ""\n\
 echo "🌐 WebUI 地址: http://0.0.0.0:7860"\n\
 echo "🎭 功能标签页:"\n\
@@ -139,4 +123,4 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
     CMD curl -f http://localhost:7860/ || exit 1
 
 # 启动命令
-CMD ["/app/start.sh"] 
+CMD ["/app/start.sh"]

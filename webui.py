@@ -214,8 +214,8 @@ if os.path.exists("tests/cases.jsonl"):
                 if not line:
                     continue
                 example = json.loads(line)
+                # 移除参考音频，只保留文本和推理模式
                 example_cases.append([
-                    os.path.join("tests", example.get("prompt_audio", "sample_prompt.wav")),
                     example.get("text"), 
                     ["普通推理", "批次推理"][example.get("infer_mode", 0)]
                 ])
@@ -332,6 +332,18 @@ def on_demo_audio_select(category, subcategory, filename):
             return gr.update(value=audio_path)
     return gr.update(value=None)
 
+def clear_text():
+    """清空目标文本框内容"""
+    return gr.update(value="")
+
+def auto_use_demo_audio(category, subcategory, filename):
+    """当音频文件被选中时自动使用该音频"""
+    if category and subcategory and filename:
+        audio_path = get_demo_audio_path(category, subcategory, filename)
+        if audio_path and os.path.exists(audio_path):
+            return gr.update(value=audio_path)
+    return gr.update(value=None)
+
 # 创建 Gradio 界面
 with gr.Blocks(
     title="IndexTTS Demo - 统一版本", 
@@ -411,12 +423,15 @@ with gr.Blocks(
                 )
                 
             with gr.Column(scale=2):
-                input_text_single = gr.TextArea(
-                    label="📝 目标文本",
-                    placeholder="请输入要合成的文本...",
-                    info=f"当前模型版本: {getattr(tts, 'model_version', None) or '1.0'}",
-                    lines=6
-                )
+                with gr.Row():
+                    input_text_single = gr.TextArea(
+                        label="📝 目标文本",
+                        placeholder="请输入要合成的文本...",
+                        info=f"当前模型版本: {getattr(tts, 'model_version', None) or '1.0'}",
+                        lines=6,
+                        scale=4
+                    )
+                    clear_text_btn = gr.Button("🗑️ 清空", variant="secondary", size="sm", scale=1)
                 
                 with gr.Row():
                     infer_mode = gr.Radio(
@@ -495,7 +510,7 @@ with gr.Blocks(
         if len(example_cases) > 0:
             gr.Examples(
                 examples=example_cases,
-                inputs=[prompt_audio, input_text_single, infer_mode],
+                inputs=[input_text_single, infer_mode],  # 移除 prompt_audio
                 label="📚 示例案例"
             )
     
@@ -606,6 +621,13 @@ with gr.Blocks(
         outputs=[gen_button]
     )
     
+    # 清空文本按钮事件绑定
+    clear_text_btn.click(
+        clear_text,
+        inputs=[],
+        outputs=[input_text_single]
+    )
+    
     # Demos 相关事件绑定（只有在有demos音频时才绑定）
     if get_demo_categories():
         demo_category.change(
@@ -620,6 +642,14 @@ with gr.Blocks(
             outputs=[demo_audio_file]
         )
         
+        # 音频文件选择时自动使用该音频
+        demo_audio_file.change(
+            auto_use_demo_audio,
+            inputs=[demo_category, demo_subcategory, demo_audio_file],
+            outputs=[prompt_audio]
+        )
+        
+        # 保留手动使用按钮功能
         use_demo_btn.click(
             on_demo_audio_select,
             inputs=[demo_category, demo_subcategory, demo_audio_file],
