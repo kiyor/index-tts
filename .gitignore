@@ -13,3 +13,6 @@ build/
 *.py[cod]
 *.egg-info/
 .venv
+# 忽略所有wav文件，但保留demos目录中的wav文件
+*.wav
+!demos/**/*.wav

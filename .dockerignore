@@ -51,13 +51,18 @@ tmp/
 temp/
 *.tmp
 
-# 输出文件
+# 运行时目录 (通过挂载提供，不应复制)
 outputs/
+demos/
+checkpoints/
+prompts/
+
+# 音频文件 (运行时生成或挂载)
 *.wav
 *.mp3
 *.flac
 
-# 测试文件
+# 测试生成的文件
 test_*.wav
 gen.wav
 
@@ -65,10 +70,25 @@ gen.wav
 .cache/
 .pytest_cache/
 
-# 文档
+# Docker 相关文件
+Dockerfile*
+docker-compose*.yml
+.dockerignore
+docker-start.sh
+test_docker.sh
+test_build_cache.sh
+
+# 监控和部署配置
+nginx/
+monitoring/
+
+# 文档 (除了核心文档)
 docs/
-*.md
-!README.md
+DOCKER_USAGE.md
+DEMOS_USAGE.md
+WEBUI_UNIFIED.md
+DOCKER_UPDATE_SUMMARY.md
+DOCKERFILE_OPTIMIZATION.md
 
 # 配置文件
 .env
@@ -78,8 +98,19 @@ docs/
 *.pth
 *.bin
 *.safetensors
-checkpoints/
+
+# 已移除的旧WebUI文件
+webui_fixed.py
+webui_demos.py
+start_demos.sh
+
+# 预编译相关 (保留 precompile_extensions.py，排除其他)
+# precompile_extensions.py - 需要复制到容器中
+*.precompile.log
 
 # 其他
 *.tar.gz
-*.zip 
+*.zip
+
+# 预构建的 CUDA 扩展资源 (需要复制到容器中)
+# docker_assets/ - 包含预构建的 CUDA 扩展二进制文件，必须复制 

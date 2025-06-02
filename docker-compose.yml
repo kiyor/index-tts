@@ -3,7 +3,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: indextts-webui
+    container_name: indextts-webui-unified
     ports:
       - "7860:7860"
     volumes:
@@ -13,6 +13,8 @@ services:
       - ./outputs:/app/outputs
       # 挂载提示音频目录 (读写)
       - ./prompts:/app/prompts
+      # 挂载demos音频库目录 (只读)
+      - ./demos:/app/demos:ro
       # 挂载测试数据 (只读)
       - ./test_data:/app/test_data:ro
       # 挂载日志目录
