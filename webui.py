@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 IndexTTS WebUI - 统一版本
-包含 bitsandbytes 兼容性修复、Docker 支持、Demos 音频选择功能和系统信息
+包含 bitsandbytes 兼容性修复、Docker 支持、Demos 音频选择功能、系统信息和队列管理
 """
 
 # 修复 bitsandbytes 兼容性问题
@@ -14,6 +14,12 @@ import sys
 import threading
 import time
 import glob
+import queue
+import uuid
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Any
+from collections import deque
+import statistics
 
 import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -95,6 +101,212 @@ except ImportError:
             return text
     i18n = SimpleI18n()
 
+# 任务状态枚举
+@dataclass
+class TaskStatus:
+    QUEUED = "queued"      # 排队中
+    RUNNING = "running"    # 执行中
+    COMPLETED = "completed"  # 已完成
+    FAILED = "failed"      # 失败
+
+@dataclass
+class Task:
+    """任务数据结构"""
+    id: str
+    prompt: str
+    text: str
+    infer_mode: str
+    params: Dict[str, Any]
+    status: str = TaskStatus.QUEUED
+    created_time: float = 0
+    start_time: float = 0
+    end_time: float = 0
+    result_path: Optional[str] = None
+    error_message: Optional[str] = None
+    
+    def __post_init__(self):
+        if self.created_time == 0:
+            self.created_time = time.time()
+
+class TaskQueue:
+    """任务队列管理器"""
+    
+    def __init__(self, max_history=50):
+        self.queue = queue.Queue()
+        self.current_task: Optional[Task] = None
+        self.task_history: deque = deque(maxlen=max_history)
+        self.execution_times: deque = deque(maxlen=20)  # 保存最近20次执行时间用于预估
+        self.worker_thread = None
+        self.is_running = False
+        self.lock = threading.Lock()
+        
+    def start_worker(self, tts_instance):
+        """启动队列处理工作线程"""
+        if self.worker_thread is None or not self.worker_thread.is_alive():
+            self.is_running = True
+            self.worker_thread = threading.Thread(target=self._worker, args=(tts_instance,), daemon=True)
+            self.worker_thread.start()
+            
+    def stop_worker(self):
+        """停止队列处理工作线程"""
+        self.is_running = False
+        
+    def add_task(self, prompt: str, text: str, infer_mode: str, params: Dict[str, Any]) -> str:
+        """添加任务到队列"""
+        task = Task(
+            id=str(uuid.uuid4())[:8],
+            prompt=prompt,
+            text=text,
+            infer_mode=infer_mode,
+            params=params
+        )
+        
+        with self.lock:
+            self.queue.put(task)
+            
+        print(f"📝 任务 {task.id} 已加入队列")
+        return task.id
+        
+    def get_queue_status(self) -> Dict[str, Any]:
+        """获取队列状态信息"""
+        with self.lock:
+            queue_size = self.queue.qsize()
+            current_task_info = None
+            
+            if self.current_task:
+                elapsed = time.time() - self.current_task.start_time
+                estimated_remaining = self._estimate_remaining_time()
+                current_task_info = {
+                    'id': self.current_task.id,
+                    'text_preview': self.current_task.text[:50] + ('...' if len(self.current_task.text) > 50 else ''),
+                    'elapsed_time': elapsed,
+                    'estimated_remaining': estimated_remaining
+                }
+                
+            return {
+                'queue_size': queue_size,
+                'current_task': current_task_info,
+                'total_completed': len([t for t in self.task_history if t.status == TaskStatus.COMPLETED]),
+                'average_execution_time': statistics.mean(self.execution_times) if self.execution_times else 0,
+                'estimated_wait_time': self._estimate_wait_time(queue_size)
+            }
+            
+    def get_task_result(self, task_id: str) -> Optional[Task]:
+        """根据任务ID获取任务结果"""
+        with self.lock:
+            # 检查当前任务
+            if self.current_task and self.current_task.id == task_id:
+                return self.current_task
+                
+            # 检查历史任务
+            for task in self.task_history:
+                if task.id == task_id:
+                    return task
+                    
+        return None
+        
+    def _worker(self, tts_instance):
+        """队列处理工作线程"""
+        print("🔄 队列处理器已启动")
+        
+        while self.is_running:
+            try:
+                # 等待任务，超时检查是否需要停止
+                task = self.queue.get(timeout=1)
+                
+                with self.lock:
+                    self.current_task = task
+                    task.status = TaskStatus.RUNNING
+                    task.start_time = time.time()
+                
+                print(f"🚀 开始执行任务 {task.id}")
+                
+                try:
+                    # 执行任务
+                    output_path = os.path.join("outputs", f"task_{task.id}_{int(time.time())}.wav")
+                    
+                    # 根据推理模式过滤参数
+                    if task.infer_mode == "普通推理":
+                        # 普通推理不支持 sentences_bucket_max_size 参数
+                        infer_params = {k: v for k, v in task.params.items() 
+                                      if k != 'sentences_bucket_max_size'}
+                        result = tts_instance.infer(
+                            task.prompt, 
+                            task.text, 
+                            output_path,
+                            verbose=cmd_args.verbose,
+                            **infer_params
+                        )
+                    else:
+                        # 批次推理支持所有参数
+                        result = tts_instance.infer_fast(
+                            task.prompt, 
+                            task.text, 
+                            output_path,
+                            verbose=cmd_args.verbose,
+                            **task.params
+                        )
+                    
+                    # 任务完成
+                    with self.lock:
+                        task.status = TaskStatus.COMPLETED
+                        task.end_time = time.time()
+                        task.result_path = result
+                        
+                        # 记录执行时间用于预估
+                        execution_time = task.end_time - task.start_time
+                        self.execution_times.append(execution_time)
+                        
+                        # 移动到历史记录
+                        self.task_history.append(task)
+                        self.current_task = None
+                        
+                    print(f"✅ 任务 {task.id} 完成，耗时 {execution_time:.2f} 秒")
+                    
+                except Exception as e:
+                    # 任务失败
+                    with self.lock:
+                        task.status = TaskStatus.FAILED
+                        task.end_time = time.time()
+                        task.error_message = str(e)
+                        
+                        # 移动到历史记录
+                        self.task_history.append(task)
+                        self.current_task = None
+                        
+                    print(f"❌ 任务 {task.id} 失败: {e}")
+                    
+                finally:
+                    self.queue.task_done()
+                    
+            except queue.Empty:
+                continue
+            except Exception as e:
+                print(f"❌ 队列处理器错误: {e}")
+                
+        print("🛑 队列处理器已停止")
+        
+    def _estimate_remaining_time(self) -> float:
+        """预估当前任务剩余时间"""
+        if not self.current_task or not self.execution_times:
+            return 0
+            
+        avg_time = statistics.mean(self.execution_times)
+        elapsed = time.time() - self.current_task.start_time
+        return max(0, avg_time - elapsed)
+        
+    def _estimate_wait_time(self, queue_size: int) -> float:
+        """预估排队等待时间"""
+        if queue_size == 0 or not self.execution_times:
+            return 0
+            
+        avg_time = statistics.mean(self.execution_times)
+        current_remaining = self._estimate_remaining_time()
+        return current_remaining + (queue_size * avg_time)
+
+# 全局队列实例
+task_queue = TaskQueue()
+
 print("🔧 正在初始化 IndexTTS...")
 try:
     tts = IndexTTS(
@@ -102,6 +314,10 @@ try:
         cfg_path=os.path.join(cmd_args.model_dir, "config.yaml")
     )
     print("✅ IndexTTS 初始化成功")
+    
+    # 启动队列处理器
+    task_queue.start_worker(tts)
+    
 except Exception as e:
     print(f"❌ IndexTTS 初始化失败: {e}")
     import traceback
@@ -223,27 +439,22 @@ if os.path.exists("tests/cases.jsonl"):
     except Exception as e:
         print(f"⚠️  加载示例案例失败: {e}")
 
-def gen_single(prompt, text, infer_mode, max_text_tokens_per_sentence=120, sentences_bucket_max_size=4,
-                *args, progress=gr.Progress()):
-    """生成语音的主函数"""
+def gen_single_with_queue(prompt, text, infer_mode, max_text_tokens_per_sentence=120, sentences_bucket_max_size=4,
+                         *args, progress=gr.Progress()):
+    """使用队列的语音生成函数"""
     if not prompt:
         gr.Warning("请上传参考音频文件或选择预设音频")
-        return gr.update(value=None, visible=True)
+        return gr.update(value=None, visible=True), "请上传参考音频"
     
     if not text or not text.strip():
         gr.Warning("请输入要合成的文本")
-        return gr.update(value=None, visible=True)
-    
-    output_path = os.path.join("outputs", f"spk_{int(time.time())}.wav")
-    
-    # 设置进度条
-    tts.gr_progress = progress
+        return gr.update(value=None, visible=True), "请输入要合成的文本"
     
     # 解析参数
     do_sample, top_p, top_k, temperature, \
         length_penalty, num_beams, repetition_penalty, max_mel_tokens = args
     
-    kwargs = {
+    params = {
         "do_sample": bool(do_sample),
         "top_p": float(top_p),
         "top_k": int(top_k) if int(top_k) > 0 else None,
@@ -252,36 +463,72 @@ def gen_single(prompt, text, infer_mode, max_text_tokens_per_sentence=120, sente
         "num_beams": int(num_beams),
         "repetition_penalty": float(repetition_penalty),
         "max_mel_tokens": int(max_mel_tokens),
+        "max_text_tokens_per_sentence": int(max_text_tokens_per_sentence),
+        "sentences_bucket_max_size": int(sentences_bucket_max_size)
     }
     
-    try:
-        start_time = time.time()
-        if infer_mode == "普通推理":
-            output = tts.infer(
-                prompt, text, output_path, 
-                verbose=cmd_args.verbose,
-                max_text_tokens_per_sentence=int(max_text_tokens_per_sentence),
-                **kwargs
-            )
+    # 添加任务到队列
+    task_id = task_queue.add_task(prompt, text, infer_mode, params)
+    
+    gr.Info(f"🎯 任务 {task_id} 已提交到队列")
+    
+    # 轮询等待任务完成
+    max_wait_time = 300  # 最大等待5分钟
+    start_wait = time.time()
+    
+    while time.time() - start_wait < max_wait_time:
+        task = task_queue.get_task_result(task_id)
+        
+        if task and task.status == TaskStatus.COMPLETED:
+            gr.Info(f"✅ 任务 {task_id} 完成！")
+            return gr.update(value=task.result_path, visible=True), f"任务 {task_id} 已完成"
+        elif task and task.status == TaskStatus.FAILED:
+            gr.Error(f"❌ 任务 {task_id} 失败: {task.error_message}")
+            return gr.update(value=None, visible=True), f"任务失败: {task.error_message}"
+        
+        # 更新进度信息
+        if task and task.status == TaskStatus.RUNNING:
+            elapsed = time.time() - task.start_time
+            progress(0.5, f"任务 {task_id} 执行中... ({elapsed:.1f}s)")
         else:
-            # 批次推理
-            output = tts.infer_fast(
-                prompt, text, output_path, 
-                verbose=cmd_args.verbose,
-                max_text_tokens_per_sentence=int(max_text_tokens_per_sentence),
-                sentences_bucket_max_size=int(sentences_bucket_max_size),
-                **kwargs
-            )
+            queue_status = task_queue.get_queue_status()
+            if queue_status['queue_size'] > 0:
+                progress(0.1, f"排队中... 前面还有 {queue_status['queue_size']} 个任务")
         
-        end_time = time.time()
-        gr.Info(f"✅ 生成完成！耗时 {end_time - start_time:.2f} 秒")
-        return gr.update(value=output, visible=True)
-        
-    except Exception as e:
-        error_msg = f"生成失败: {str(e)}"
-        print(f"❌ {error_msg}")
-        gr.Error(error_msg)
-        return gr.update(value=None, visible=True)
+        time.sleep(1)
+    
+    gr.Error(f"❌ 任务 {task_id} 超时")
+    return gr.update(value=None, visible=True), "任务超时"
+
+def get_queue_status_display():
+    """获取队列状态显示信息"""
+    status = task_queue.get_queue_status()
+    
+    if status['current_task']:
+        current_info = status['current_task']
+        current_text = f"""
+        🔄 **当前执行任务**
+        - 任务ID: {current_info['id']}
+        - 内容预览: {current_info['text_preview']}
+        - 已执行时间: {current_info['elapsed_time']:.1f}s
+        - 预估剩余: {current_info['estimated_remaining']:.1f}s
+        """
+    else:
+        current_text = "💤 **当前无任务执行**"
+    
+    queue_info = f"""
+    📊 **队列状态**
+    - 排队任务数: {status['queue_size']}
+    - 已完成任务: {status['total_completed']}
+    - 平均执行时间: {status['average_execution_time']:.1f}s
+    - 预估等待时间: {status['estimated_wait_time']:.1f}s
+    """
+    
+    return current_text + "\n" + queue_info
+
+def refresh_queue_status():
+    """刷新队列状态"""
+    return get_queue_status_display()
 
 def update_prompt_audio():
     """更新提示音频按钮状态"""
@@ -363,6 +610,13 @@ with gr.Blocks(
         margin-bottom: 15px;
         background-color: #f9f9f9;
     }
+    .queue-status {
+        border: 1px solid #2196f3;
+        border-radius: 8px;
+        padding: 15px;
+        margin-bottom: 15px;
+        background-color: #e3f2fd;
+    }
     """
 ) as demo:
     mutex = threading.Lock()
@@ -376,12 +630,28 @@ with gr.Blocks(
             <img src='https://img.shields.io/badge/Status-Fixed-green'>
             <img src='https://img.shields.io/badge/Docker-Supported-blue'>
             <img src='https://img.shields.io/badge/Demos-Enabled-orange'>
+            <img src='https://img.shields.io/badge/Queue-Enabled-purple'>
         </p>
-        <p><strong>✅ 已修复 bitsandbytes 兼容性问题 | 支持 Docker 部署 | 🎵 支持预设音频选择</strong></p>
+        <p><strong>✅ 已修复 bitsandbytes 兼容性问题 | 支持 Docker 部署 | 🎵 支持预设音频选择 | 📋 智能队列管理</strong></p>
     </div>
     ''')
     
     with gr.Tab("🎵 音频生成"):
+        # 队列状态显示
+        with gr.Group():
+            gr.Markdown("### 📋 队列状态", elem_classes=["queue-status"])
+            queue_status_display = gr.Markdown(
+                get_queue_status_display(),
+                elem_classes=["queue-status"]
+            )
+            with gr.Row():
+                refresh_queue_btn = gr.Button("🔄 刷新状态", size="sm")
+                task_status_output = gr.Textbox(
+                    label="任务状态", 
+                    interactive=False,
+                    placeholder="任务状态将在这里显示..."
+                )
+        
         with gr.Row():
             with gr.Column(scale=1):
                 # 预设音频选择区域
@@ -441,7 +711,7 @@ with gr.Blocks(
                     )
 
                 with gr.Row():
-                    gen_button = gr.Button("🎯 生成语音", variant="primary", size="lg")
+                    gen_button = gr.Button("🎯 提交到队列", variant="primary", size="lg")
                     clear_text_btn = gr.Button("🗑️ 清空", variant="secondary", size="lg")
         
         output_audio = gr.Audio(label="🎵 生成结果", visible=True)
@@ -586,6 +856,12 @@ with gr.Blocks(
                 - **DeepSpeed**: ⚠️ 未安装 (自动回退)
                 - **BigVGAN CUDA**: ⚠️ 回退到 torch 实现
                 
+                ### 📋 队列管理
+                - **队列功能**: ✅ 已启用
+                - **并发限制**: 1个任务
+                - **历史统计**: 最近20次执行时间
+                - **时间预估**: 基于历史算力
+                
                 ### 🎭 Demos 功能
                 - **音频分类**: {total_categories}
                 - **总音频数**: {total_files}
@@ -630,6 +906,13 @@ with gr.Blocks(
         outputs=[input_text_single]
     )
     
+    # 队列状态刷新
+    refresh_queue_btn.click(
+        refresh_queue_status,
+        inputs=[],
+        outputs=[queue_status_display]
+    )
+    
     # Demos 相关事件绑定（只有在有demos音频时才绑定）
     if get_demo_categories():
         demo_category.change(
@@ -658,14 +941,22 @@ with gr.Blocks(
             outputs=[prompt_audio]
         )
     
+    # 修改生成按钮事件，使用队列版本
     gen_button.click(
-        gen_single,
+        gen_single_with_queue,
         inputs=[
             prompt_audio, input_text_single, infer_mode,
             max_text_tokens_per_sentence, sentences_bucket_max_size,
             *advanced_params,
         ],
-        outputs=[output_audio]
+        outputs=[output_audio, task_status_output]
+    )
+    
+    # 初始化队列状态显示
+    demo.load(
+        refresh_queue_status,
+        inputs=[],
+        outputs=[queue_status_display]
     )
 
 if __name__ == "__main__":
@@ -674,6 +965,7 @@ if __name__ == "__main__":
     print(f"   模型目录: {cmd_args.model_dir}")
     print(f"   详细模式: {cmd_args.verbose}")
     print(f"   分享链接: {cmd_args.share}")
+    print(f"   队列管理: ✅ 已启用")
     
     # 获取demos统计信息
     total_categories, total_files, _ = get_demos_statistics()
@@ -682,11 +974,16 @@ if __name__ == "__main__":
     print("   按 Ctrl+C 停止服务")
     print("=" * 50)
     
-    demo.queue(max_size=20)
-    demo.launch(
-        server_name=cmd_args.host,
-        server_port=cmd_args.port,
-        share=cmd_args.share,
-        inbrowser=not cmd_args.share,  # 如果不分享则自动打开浏览器
-        show_error=True
-    )
+    try:
+        demo.queue(max_size=20)
+        demo.launch(
+            server_name=cmd_args.host,
+            server_port=cmd_args.port,
+            share=cmd_args.share,
+            inbrowser=not cmd_args.share,  # 如果不分享则自动打开浏览器
+            show_error=True
+        )
+    finally:
+        # 确保队列处理器正常停止
+        task_queue.stop_worker()
+        print("🛑 队列处理器已停止")
