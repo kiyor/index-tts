@@ -431,7 +431,6 @@ with gr.Blocks(
                         lines=6,
                         scale=4
                     )
-                    clear_text_btn = gr.Button("🗑️ 清空", variant="secondary", size="sm", scale=1)
                 
                 with gr.Row():
                     infer_mode = gr.Radio(
@@ -440,7 +439,10 @@ with gr.Blocks(
                         info="批次推理：更适合长句，性能翻倍",
                         value="普通推理"
                     )
+
+                with gr.Row():
                     gen_button = gr.Button("🎯 生成语音", variant="primary", size="lg")
+                    clear_text_btn = gr.Button("🗑️ 清空", variant="secondary", size="lg")
         
         output_audio = gr.Audio(label="🎵 生成结果", visible=True)
         

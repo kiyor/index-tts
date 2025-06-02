@@ -79,9 +79,8 @@ RUN echo "🔧 强制重新编译 CUDA 扩展..." && \
 # 复制其他文件
 COPY --chown=indextts:indextts tests/ ./tests/
 COPY --chown=indextts:indextts assets/ ./assets/
-COPY --chown=indextts:indextts test_data/ ./test_data/
 COPY --chown=indextts:indextts *.md ./
-COPY --chown=indextts:indextts webui.py test_indextts.py create_test_audio.py fix_bitsandbytes.py ./
+COPY --chown=indextts:indextts webui.py create_test_audio.py fix_bitsandbytes.py ./
 
 # 创建必要的目录
 RUN mkdir -p /app/outputs /app/prompts /app/demos /app/logs /app/checkpoints
