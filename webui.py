@@ -603,19 +603,103 @@ with gr.Blocks(
         text-align: center;
         margin-bottom: 20px;
     }
+    
+    /* 默认样式 - 浅色主题 */
     .demos-section {
-        border: 1px solid #e0e0e0;
-        border-radius: 8px;
-        padding: 15px;
-        margin-bottom: 15px;
-        background-color: #f9f9f9;
+        border: 1px solid #e0e0e0 !important;
+        border-radius: 8px !important;
+        padding: 15px !important;
+        margin-bottom: 15px !important;
+        background-color: #f9f9f9 !important;
+        color: #333333 !important;
     }
+    
     .queue-status {
-        border: 1px solid #2196f3;
-        border-radius: 8px;
-        padding: 15px;
-        margin-bottom: 15px;
-        background-color: #e3f2fd;
+        border: 1px solid #1976d2 !important;
+        border-radius: 8px !important;
+        padding: 15px !important;
+        margin-bottom: 15px !important;
+        background-color: #f3f9ff !important;
+        color: #0d47a1 !important;
+        transition: all 0.3s ease !important;
+    }
+    
+    /* 暗色主题覆盖样式 - 使用Gradio的.dark选择器 */
+    .dark .demos-section {
+        border: 1px solid #404040 !important;
+        background-color: #2a2a2a !important;
+        color: #e0e0e0 !important;
+    }
+    
+    .dark .queue-status {
+        border: 1px solid #64b5f6 !important;
+        background-color: #1a237e !important;
+        color: #bbdefb !important;
+    }
+    
+    /* 状态文本样式优化 */
+    .queue-status .markdown {
+        font-family: 'SF Mono', 'Monaco', 'Inconsolata', 'Roboto Mono', monospace !important;
+        line-height: 1.6 !important;
+    }
+    
+    .queue-status h3 {
+        margin-top: 0 !important;
+        margin-bottom: 10px !important;
+        font-weight: 600 !important;
+    }
+    
+    .queue-status strong {
+        font-weight: 700 !important;
+    }
+    
+    /* 按钮样式优化 */
+    .queue-refresh-btn {
+        background: linear-gradient(45deg, #2196f3, #21cbf3) !important;
+        border: none !important;
+        color: white !important;
+        font-weight: 500 !important;
+        transition: all 0.3s ease !important;
+    }
+    
+    .queue-refresh-btn:hover {
+        background: linear-gradient(45deg, #1976d2, #0288d1) !important;
+        transform: translateY(-1px) !important;
+        box-shadow: 0 4px 8px rgba(33, 150, 243, 0.3) !important;
+    }
+    
+    /* 系统自适应暗色主题检测 */
+    @media (prefers-color-scheme: dark) {
+        .demos-section {
+            border: 1px solid #404040 !important;
+            background-color: #2a2a2a !important;
+            color: #e0e0e0 !important;
+        }
+        .queue-status {
+            border: 1px solid #64b5f6 !important;
+            background-color: #1a237e !important;
+            color: #bbdefb !important;
+        }
+    }
+    
+    /* 高对比度模式支持 */
+    @media (prefers-contrast: high) {
+        .queue-status {
+            border-width: 2px !important;
+            font-weight: 600 !important;
+        }
+    }
+    
+    /* 移动端适配 */
+    @media (max-width: 768px) {
+        .gradio-container {
+            max-width: 100% !important;
+            padding: 10px !important;
+        }
+        .queue-status {
+            padding: 10px !important;
+            margin-bottom: 10px !important;
+        }
     }
     """
 ) as demo:
@@ -638,14 +722,13 @@ with gr.Blocks(
     
     with gr.Tab("🎵 音频生成"):
         # 队列状态显示
-        with gr.Group():
-            gr.Markdown("### 📋 队列状态", elem_classes=["queue-status"])
+        with gr.Group(elem_classes=["queue-status"]):
+            gr.Markdown("### 📋 队列状态")
             queue_status_display = gr.Markdown(
-                get_queue_status_display(),
-                elem_classes=["queue-status"]
+                get_queue_status_display()
             )
             with gr.Row():
-                refresh_queue_btn = gr.Button("🔄 刷新状态", size="sm")
+                refresh_queue_btn = gr.Button("🔄 刷新状态", size="sm", elem_classes=["queue-refresh-btn"])
                 task_status_output = gr.Textbox(
                     label="任务状态", 
                     interactive=False,
@@ -656,7 +739,7 @@ with gr.Blocks(
             with gr.Column(scale=1):
                 # 预设音频选择区域
                 if get_demo_categories():
-                    with gr.Group():
+                    with gr.Group(elem_classes=["demos-section"]):
                         gr.Markdown("### 🎭 选择预设音频")
                         
                         # 获取初始化值
