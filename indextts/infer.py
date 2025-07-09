@@ -25,41 +25,52 @@ from indextts.utils.checkpoint import load_checkpoint
 from indextts.utils.feature_extractors import MelSpectrogramFeatures
 
 from indextts.utils.front import TextNormalizer, TextTokenizer
+from gpu_configs import GPUOptimizer
 
 
 class IndexTTS:
     def __init__(
-        self, cfg_path="checkpoints/config.yaml", model_dir="checkpoints", is_fp16=True, device=None, use_cuda_kernel=None,
+        self, cfg_path="checkpoints/config.yaml", model_dir="checkpoints", is_fp16=True, is_bf16=False, device=None, use_cuda_kernel=None,
     ):
         """
         Args:
             cfg_path (str): path to the config file.
             model_dir (str): path to the model directory.
             is_fp16 (bool): whether to use fp16.
+            is_bf16 (bool): whether to use bf16 (only for RTX 30xx+ and newer GPUs).
             device (str): device to use (e.g., 'cuda:0', 'cpu'). If None, it will be set automatically based on the availability of CUDA or MPS.
             use_cuda_kernel (None | bool): whether to use BigVGan custom fused activation CUDA kernel, only for CUDA device.
         """
         if device is not None:
             self.device = device
             self.is_fp16 = False if device == "cpu" else is_fp16
+            self.is_bf16 = False if device == "cpu" else is_bf16
             self.use_cuda_kernel = use_cuda_kernel is not None and use_cuda_kernel and device.startswith("cuda")
         elif torch.cuda.is_available():
             self.device = "cuda:0"
             self.is_fp16 = is_fp16
+            self.is_bf16 = is_bf16
             self.use_cuda_kernel = use_cuda_kernel is None or use_cuda_kernel
         elif hasattr(torch, "mps") and torch.backends.mps.is_available():
             self.device = "mps"
             self.is_fp16 = False # Use float16 on MPS is overhead than float32
+            self.is_bf16 = False
             self.use_cuda_kernel = False
         else:
             self.device = "cpu"
             self.is_fp16 = False
+            self.is_bf16 = False
             self.use_cuda_kernel = False
             print(">> Be patient, it may take a while to run in CPU mode.")
 
         self.cfg = OmegaConf.load(cfg_path)
         self.model_dir = model_dir
-        self.dtype = torch.float16 if self.is_fp16 else None
+        if self.is_bf16:
+            self.dtype = torch.bfloat16
+        elif self.is_fp16:
+            self.dtype = torch.float16
+        else:
+            self.dtype = None
         self.stop_mel_token = self.cfg.gpt.stop_mel_token
 
         # Comment-off to load the VQ-VAE model for debugging tokenizer
@@ -79,7 +90,9 @@ class IndexTTS:
         self.gpt_path = os.path.join(self.model_dir, self.cfg.gpt_checkpoint)
         load_checkpoint(self.gpt, self.gpt_path)
         self.gpt = self.gpt.to(self.device)
-        if self.is_fp16:
+        if self.is_bf16:
+            self.gpt.eval().to(torch.bfloat16)
+        elif self.is_fp16:
             self.gpt.eval().half()
         else:
             self.gpt.eval()
@@ -121,7 +134,7 @@ class IndexTTS:
                     supports_fp16 = False
                     print(f">> 检测到 {gpu_name}，强制使用 FP32 以确保兼容性")
 
-            self.gpt.post_init_gpt2_config(use_deepspeed=use_deepspeed, kv_cache=True, half=supports_fp16)
+            self.gpt.post_init_gpt2_config(use_deepspeed=use_deepspeed, kv_cache=True, half=supports_fp16 or self.is_bf16)
         else:
             self.gpt.post_init_gpt2_config(use_deepspeed=False, kv_cache=True, half=False)
 
@@ -306,7 +319,7 @@ class IndexTTS:
             self.gr_progress(value, desc=desc)
 
     # 快速推理：对于"多句长文本"，可实现至少 2~10 倍以上的速度提升~ （First modified by sunnyboxs 2025-04-16）
-    def infer_fast(self, audio_prompt, text, output_path, verbose=False, max_text_tokens_per_sentence=100, sentences_bucket_max_size=4, **generation_kwargs):
+    def infer_fast(self, audio_prompt, text, output_path, verbose=False, max_text_tokens_per_sentence=None, sentences_bucket_max_size=None, **generation_kwargs):
         """
         Args:
             ``max_text_tokens_per_sentence``: 分句的最大token数，默认``100``，可以根据GPU硬件情况调整
@@ -316,6 +329,17 @@ class IndexTTS:
                 - 越大，bucket数量越少，batch越多，推理速度越*快*，占用内存更多，可能影响质量
                 - 越小，bucket数量越多，batch越少，推理速度越*慢*，占用内存和质量更接近于非快速推理
         """
+        
+        # GPU 优化参数自动检测
+        gpu_config = GPUOptimizer.get_gpu_config()
+        if max_text_tokens_per_sentence is None:
+            max_text_tokens_per_sentence = gpu_config['max_text_tokens_per_sentence']
+        if sentences_bucket_max_size is None:
+            sentences_bucket_max_size = gpu_config['sentences_bucket_max_size']
+        
+        # 打印GPU配置信息
+        GPUOptimizer.print_gpu_info(gpu_config)
+        
         print(">> start fast inference...")
         
         self._set_gr_progress(0, "start fast inference...")
@@ -358,11 +382,11 @@ class IndexTTS:
         top_p = generation_kwargs.pop("top_p", 0.8)
         top_k = generation_kwargs.pop("top_k", 30)
         temperature = generation_kwargs.pop("temperature", 1.0)
-        autoregressive_batch_size = 1
+        autoregressive_batch_size = gpu_config['autoregressive_batch_size']
         length_penalty = generation_kwargs.pop("length_penalty", 0.0)
         num_beams = generation_kwargs.pop("num_beams", 3)
         repetition_penalty = generation_kwargs.pop("repetition_penalty", 10.0)
-        max_mel_tokens = generation_kwargs.pop("max_mel_tokens", 600)
+        max_mel_tokens = generation_kwargs.pop("max_mel_tokens", gpu_config['max_mel_tokens'])
         sampling_rate = 24000
         # lang = "EN"
         # lang = "ZH"
@@ -435,8 +459,11 @@ class IndexTTS:
         all_latents = []
         has_warned = False
         for batch_codes, batch_tokens, batch_sentences in zip(all_batch_codes, all_text_tokens, all_sentences):
-            for i in range(batch_codes.shape[0]):
-                codes = batch_codes[i]  # [x]
+            # 修复：只处理实际的输入数量，不是autoregressive_batch_size的数量
+            actual_batch_size = len(batch_tokens)
+            for i in range(actual_batch_size):
+                # 选择第一个生成序列（autoregressive_batch_size可能>1）
+                codes = batch_codes[0] if batch_codes.shape[0] > 1 else batch_codes[i]  # [x]
                 if not has_warned and codes[-1] != self.stop_mel_token:
                     warnings.warn(
                         f"WARN: generation stopped due to exceeding `max_mel_tokens` ({max_mel_tokens}). "
@@ -469,7 +496,9 @@ class IndexTTS:
         del all_batch_codes, all_text_tokens, all_sentences
         # bigvgan chunk
         chunk_size = 2
-        all_latents = [all_latents[all_idxs.index(i)] for i in range(len(all_latents))]
+        # 修复索引重排序问题 - 按原始句子顺序排序
+        sorted_pairs = sorted(zip(all_idxs, all_latents), key=lambda x: x[0])
+        all_latents = [latent for _, latent in sorted_pairs]
         if verbose:
             print(">> all_latents:", len(all_latents))
             print("  latents length:", [l.shape[1] for l in all_latents])

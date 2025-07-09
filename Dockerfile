@@ -13,9 +13,11 @@ ENV LANG=C.UTF-8
 ENV LC_ALL=C.UTF-8
 ENV PYTHONIOENCODING=utf-8
 
-# 设置 CUDA 架构 (支持更多 GPU)
+# 设置 CUDA 架构 (支持更多 GPU, 包括 RTX 5090)
 ENV TORCH_CUDA_ARCH_LIST="6.0;6.1;7.0;7.5;8.0;8.6;8.9;9.0"
 ENV FORCE_CUDA="1"
+# RTX 5090 优化
+ENV PYTORCH_CUDA_ALLOC_CONF="max_split_size_mb:128,expandable_segments:True,roundup_power2_divisions:8"
 
 # 设置时区
 ENV TZ=America/Los_Angeles
@@ -65,12 +67,15 @@ RUN python3 -m pip install --user torch torchaudio --index-url https://download.
 # 安装基础依赖 (包括 DeepSpeed)
 RUN python3 -m pip install --user -r requirements.txt
 
-# 安装 WebUI 依赖
-RUN python3 -m pip install --user gradio pandas
+# 安装 WebUI 依赖和显存监控依赖
+RUN python3 -m pip install --user gradio pandas GPUtil psutil
 
 # 复制核心代码
 COPY --chown=indextts:indextts indextts/ ./indextts/
 COPY --chown=indextts:indextts tools/ ./tools/
+
+# 复制显存监控模块和GPU配置模块
+COPY --chown=indextts:indextts memory_monitor.py gpu_configs.py ./
 
 # 强制重新编译 CUDA 扩展
 RUN echo "🔧 强制重新编译 CUDA 扩展..." && \

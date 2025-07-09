@@ -17,7 +17,7 @@ services:
       - ./demos:/app/demos:ro
       # 挂载测试数据 (只读)
       - ./test_data:/app/test_data:ro
-      # 挂载日志目录
+      # 挂载日志目录 (读写)
       - ./logs:/app/logs
     environment:
       - CUDA_VISIBLE_DEVICES=0
@@ -25,6 +25,12 @@ services:
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
       - PYTHONUNBUFFERED=1
       - TZ=Asia/Shanghai
+      # 显存监控配置 (RTX 5090 优化 - 32GB VRAM)
+      - GPU_MEMORY_THRESHOLD=85
+      - GPU_MEMORY_FORCE_GC_THRESHOLD=95
+      - GPU_MEMORY_CHECK_INTERVAL=30
+      # PyTorch 内存分配器配置 (RTX 5090 优化)
+      - PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128,expandable_segments:True,roundup_power2_divisions:8
     deploy:
       resources:
         reservations:
@@ -33,8 +39,8 @@ services:
               count: 1
               capabilities: [gpu]
         limits:
-          memory: 16G
-          cpus: '4'
+          memory: 32G
+          cpus: '8'
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:7860/"]

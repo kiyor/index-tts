@@ -25,9 +25,8 @@ import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
 
-current_dir = os.path.dirname(os.path.abspath(__file__))
-sys.path.append(current_dir)
-sys.path.append(os.path.join(current_dir, "indextts"))
+# 添加当前目录到 Python 路径
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 import argparse
 parser = argparse.ArgumentParser(description="IndexTTS WebUI (统一版本)")
@@ -309,9 +308,19 @@ task_queue = TaskQueue()
 
 print("🔧 正在初始化 IndexTTS...")
 try:
+    # 导入GPU优化配置
+    from gpu_configs import GPUOptimizer
+    gpu_config = GPUOptimizer.get_gpu_config()
+    
+    # 打印GPU配置信息
+    GPUOptimizer.print_gpu_info(gpu_config)
+    
     tts = IndexTTS(
         model_dir=cmd_args.model_dir, 
-        cfg_path=os.path.join(cmd_args.model_dir, "config.yaml")
+        cfg_path=os.path.join(cmd_args.model_dir, "config.yaml"),
+        is_fp16=gpu_config['use_fp16'],
+        is_bf16=gpu_config['use_bf16'],
+        use_cuda_kernel=gpu_config['use_cuda_kernel']
     )
     print("✅ IndexTTS 初始化成功")
     
@@ -450,6 +459,17 @@ def gen_single_with_queue(prompt, text, infer_mode, max_text_tokens_per_sentence
         gr.Warning("请输入要合成的文本")
         return gr.update(value=None, visible=True), "请输入要合成的文本"
     
+    # 检查显存状态
+    if memory_monitor:
+        usage = memory_monitor.get_memory_usage()
+        if usage > 95:  # 如果显存使用率超过95%，强制清理
+            gr.Warning("显存使用率过高，正在进行强制清理...")
+            memory_monitor.clean_memory(force=True)
+            time.sleep(1)  # 等待清理完成
+        elif usage > 85:  # 如果显存使用率超过85%，尝试清理
+            gr.Info("正在进行显存清理...")
+            memory_monitor.clean_memory()
+    
     # 解析参数
     do_sample, top_p, top_k, temperature, \
         length_penalty, num_beams, repetition_penalty, max_mel_tokens = args
@@ -480,9 +500,15 @@ def gen_single_with_queue(prompt, text, infer_mode, max_text_tokens_per_sentence
         task = task_queue.get_task_result(task_id)
         
         if task and task.status == TaskStatus.COMPLETED:
+            # 任务完成后主动清理显存
+            if memory_monitor:
+                memory_monitor.clean_memory()
             gr.Info(f"✅ 任务 {task_id} 完成！")
             return gr.update(value=task.result_path, visible=True), f"任务 {task_id} 已完成"
         elif task and task.status == TaskStatus.FAILED:
+            # 任务失败后主动清理显存
+            if memory_monitor:
+                memory_monitor.clean_memory(force=True)
             gr.Error(f"❌ 任务 {task_id} 失败: {task.error_message}")
             return gr.update(value=None, visible=True), f"任务失败: {task.error_message}"
         
@@ -590,6 +616,59 @@ def auto_use_demo_audio(category, subcategory, filename):
         if audio_path and os.path.exists(audio_path):
             return gr.update(value=audio_path)
     return gr.update(value=None)
+
+def get_recent_outputs(limit=10):
+    """从outputs目录获取最近生成的音频文件"""
+    try:
+        output_files = []
+        for file in sorted(glob.glob("outputs/*.wav"), key=os.path.getctime, reverse=True):
+            if len(output_files) >= limit:
+                break
+            
+            filename = os.path.basename(file)
+            # 获取文件信息
+            stat = os.stat(file)
+            output_files.append({
+                'filename': filename,
+                'path': file,
+                'size': stat.st_size,
+                'created': stat.st_ctime,
+                'modified': stat.st_mtime
+            })
+        return output_files
+    except Exception as e:
+        print(f"⚠️ 读取输出文件失败: {e}")
+        return []
+
+def format_time(timestamp):
+    """格式化时间戳"""
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(timestamp))
+
+def format_size(size):
+    """格式化文件大小"""
+    for unit in ['B', 'KB', 'MB']:
+        if size < 1024:
+            return f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} GB"
+
+def refresh_recent_outputs():
+    """刷新最近输出列表"""
+    outputs = get_recent_outputs()
+    if not outputs:
+        return [], gr.update(visible=False)
+    
+    # 准备表格数据
+    data = []
+    for output in outputs:
+        data.append([
+            output['filename'],
+            format_time(output['modified']),
+            format_size(output['size']),
+            output['path']
+        ])
+    
+    return data, gr.update(visible=True)
 
 # 创建 Gradio 界面
 with gr.Blocks(
@@ -701,6 +780,36 @@ with gr.Blocks(
             margin-bottom: 10px !important;
         }
     }
+    
+    /* 最近输出表格样式 */
+    .recent-outputs {
+        margin-top: 20px;
+    }
+    
+    .recent-outputs table {
+        width: 100%;
+        border-collapse: collapse;
+    }
+    
+    .recent-outputs th,
+    .recent-outputs td {
+        padding: 12px;
+        text-align: left;
+        border-bottom: 1px solid #ddd;
+    }
+    
+    .dark .recent-outputs th,
+    .dark .recent-outputs td {
+        border-bottom: 1px solid #444;
+    }
+    
+    .recent-outputs tr:hover {
+        background-color: rgba(0, 0, 0, 0.05);
+    }
+    
+    .dark .recent-outputs tr:hover {
+        background-color: rgba(255, 255, 255, 0.05);
+    }
     """
 ) as demo:
     mutex = threading.Lock()
@@ -790,7 +899,7 @@ with gr.Blocks(
                         choices=["普通推理", "批次推理"], 
                         label="⚡ 推理模式",
                         info="批次推理：更适合长句，性能翻倍",
-                        value="普通推理"
+                        value="批次推理"
                     )
 
                 with gr.Row():
@@ -957,6 +1066,54 @@ with gr.Blocks(
                 - **分享链接**: {cmd_args.share}
                 """)
     
+    with gr.Tab("🕒 最近生成"):
+        with gr.Row():
+            gr.Markdown("### 🎵 最近生成的音频")
+            refresh_outputs_btn = gr.Button("🔄 刷新列表", variant="secondary")
+        
+        # 最近输出表格
+        recent_outputs_table = gr.Dataframe(
+            headers=["文件名", "生成时间", "大小", "路径"],
+            datatype=["str", "str", "str", "str"],
+            col_count=(4, "fixed"),
+            elem_classes=["recent-outputs"]
+        )
+        
+        # 选中音频播放器
+        selected_output_audio = gr.Audio(
+            label="🎵 选中的音频",
+            visible=False,
+            elem_id="selected_output_audio"
+        )
+        
+        # 事件绑定
+        refresh_outputs_btn.click(
+            refresh_recent_outputs,
+            outputs=[recent_outputs_table, selected_output_audio]
+        )
+        
+        # 表格选择事件
+        def on_table_select(evt: gr.SelectData):
+            """处理表格选择事件"""
+            if evt.index is not None and len(evt.index) >= 2:
+                # 获取选中行的数据
+                outputs = get_recent_outputs()
+                if evt.index[0] < len(outputs):
+                    selected_file = outputs[evt.index[0]]
+                    return gr.update(value=selected_file['path'], visible=True)
+            return gr.update(visible=False)
+        
+        recent_outputs_table.select(
+            on_table_select,
+            outputs=[selected_output_audio]
+        )
+        
+        # 初始加载
+        demo.load(
+            refresh_recent_outputs,
+            outputs=[recent_outputs_table, selected_output_audio]
+        )
+    
     # 高级参数列表
     advanced_params = [
         do_sample, top_p, top_k, temperature,
@@ -1042,6 +1199,45 @@ with gr.Blocks(
         outputs=[queue_status_display]
     )
 
+# 导入显存监控
+from memory_monitor import GPUMemoryMonitor
+
+# 初始化显存监控器
+memory_monitor = GPUMemoryMonitor(
+    threshold_percent=float(os.environ.get('GPU_MEMORY_THRESHOLD', 90)),
+    force_gc_threshold=float(os.environ.get('GPU_MEMORY_FORCE_GC_THRESHOLD', 95)),
+    check_interval=int(os.environ.get('GPU_MEMORY_CHECK_INTERVAL', 300))
+)
+
+def get_system_info():
+    """获取系统信息，包括显存使用情况"""
+    info = {}
+    
+    # 基本系统信息
+    info.update({
+        'python_version': sys.version,
+        'working_directory': os.getcwd(),
+        'model_directory': cmd_args.model_dir,
+        'gpu_available': torch.cuda.is_available(),
+        'gpu_count': torch.cuda.device_count() if torch.cuda.is_available() else 0,
+        'cuda_version': torch.version.cuda if torch.cuda.is_available() else 'N/A'
+    })
+    
+    # 获取显存监控信息
+    if memory_monitor:
+        info.update(memory_monitor.get_memory_info())
+    
+    return info
+
+def process_tts_task(text, *args):
+    try:
+        result = original_tts_function(text, *args)
+        # 主动清理
+        memory_monitor.clean_memory()
+        return result
+    except Exception as e:
+        raise e
+
 if __name__ == "__main__":
     print("\n🌐 启动 IndexTTS WebUI (统一版本)...")
     print(f"   地址: http://{cmd_args.host}:{cmd_args.port}")
@@ -1049,6 +1245,13 @@ if __name__ == "__main__":
     print(f"   详细模式: {cmd_args.verbose}")
     print(f"   分享链接: {cmd_args.share}")
     print(f"   队列管理: ✅ 已启用")
+    
+    # 启动显存监控
+    try:
+        memory_monitor.start()
+        print("✅ 显存监控已启动")
+    except Exception as e:
+        print(f"⚠️ 显存监控启动失败: {e}")
     
     # 获取demos统计信息
     total_categories, total_files, _ = get_demos_statistics()
@@ -1058,7 +1261,7 @@ if __name__ == "__main__":
     print("=" * 50)
     
     try:
-        demo.queue(max_size=20)
+        demo.queue(max_size=20)  # 设置队列大小
         demo.launch(
             server_name=cmd_args.host,
             server_port=cmd_args.port,
@@ -1067,6 +1270,9 @@ if __name__ == "__main__":
             show_error=True
         )
     finally:
-        # 确保队列处理器正常停止
+        # 停止显存监控
+        if memory_monitor:
+            memory_monitor.stop()
+        # 停止队列处理器
         task_queue.stop_worker()
-        print("🛑 队列处理器已停止")
+        print("🛑 服务已停止")
