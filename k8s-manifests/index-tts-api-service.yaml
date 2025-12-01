@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: index-tts-api-service
+  namespace: kiyor
+spec:
+  ports:
+  - port: 7871
+    protocol: TCP
+    targetPort: 7871
+  type: ClusterIP

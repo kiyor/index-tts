@@ -1,0 +1,30 @@
+[Unit]
+Description=IndexTTS API Server
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=kiyor
+Group=kiyor
+WorkingDirectory=/home/kiyor/index-tts
+Environment=PATH=/home/kiyor/miniconda3/envs/index-tts/bin
+Environment=CONDA_DEFAULT_ENV=index-tts
+Environment=CONDA_PREFIX=/home/kiyor/miniconda3/envs/index-tts
+Environment=PYTHONPATH=/home/kiyor/index-tts
+ExecStartPre=/bin/bash -c 'source /home/kiyor/miniconda3/etc/profile.d/conda.sh && conda activate index-tts && pip install -r requirements_api.txt'
+ExecStart=/home/kiyor/miniconda3/envs/index-tts/bin/python api_server.py --host 0.0.0.0 --port 7871
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+KillMode=mixed
+KillSignal=SIGINT
+TimeoutStopSec=30
+
+# Resource limits
+LimitNOFILE=65536
+LimitNPROC=4096
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,21 @@
+[Unit]
+Description=IndexTTS Web Service
+After=network.target
+
+[Service]
+Type=simple
+User=kiyor
+Group=kiyor
+WorkingDirectory=/home/kiyor/index-tts
+Environment="PATH=/home/kiyor/miniconda3/envs/index-tts/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Environment="PYTHONUNBUFFERED=1"
+ExecStart=/home/kiyor/index-tts/start_index_tts.sh
+Restart=always
+RestartSec=10
+
+# Logging
+StandardOutput=append:/home/kiyor/index-tts/logs/index-tts.log
+StandardError=append:/home/kiyor/index-tts/logs/index-tts-error.log
+
+[Install]
+WantedBy=multi-user.target

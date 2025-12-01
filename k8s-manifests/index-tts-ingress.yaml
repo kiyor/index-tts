@@ -1,0 +1,53 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: index-tts-ingress
+  namespace: kiyor
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-dns
+    external-dns.alpha.kubernetes.io/hostname: index-tts.kiyor.us
+    nginx.ingress.kubernetes.io/ssl-redirect: "false"
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: index-tts.kiyor.us
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: index-tts-service
+            port:
+              number: 7870
+  tls:
+  - hosts:
+    - index-tts.kiyor.us
+    secretName: index-tts-kiyor-us-tls
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: index-tts-api-ingress
+  namespace: kiyor
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-dns
+    external-dns.alpha.kubernetes.io/hostname: index-tts-api.kiyor.us
+    nginx.ingress.kubernetes.io/ssl-redirect: "false"
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: index-tts-api.kiyor.us
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: index-tts-api-service
+            port:
+              number: 7871
+  tls:
+  - hosts:
+    - index-tts-api.kiyor.us
+    secretName: index-tts-api-kiyor-us-tls
