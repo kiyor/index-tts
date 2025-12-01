@@ -1,415 +1,1121 @@
-import html
+#!/usr/bin/env python3
+"""
+IndexTTS WebUI - 统一版本
+包含 bitsandbytes 兼容性修复、Docker 支持、Demos 音频选择功能、系统信息和队列管理
+"""
+
+# 修复 bitsandbytes 兼容性问题
+import sys
+sys.modules['bitsandbytes'] = None
+
 import json
 import os
 import sys
 import threading
 import time
+import glob
+import queue
+import uuid
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Any
+from collections import deque
+import statistics
 
 import warnings
-
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
 
-import pandas as pd
-
-current_dir = os.path.dirname(os.path.abspath(__file__))
-sys.path.append(current_dir)
-sys.path.append(os.path.join(current_dir, "indextts"))
+# 添加当前目录到 Python 路径
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 import argparse
-parser = argparse.ArgumentParser(
-    description="IndexTTS WebUI",
-    formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-)
+parser = argparse.ArgumentParser(description="IndexTTS WebUI (统一版本)")
 parser.add_argument("--verbose", action="store_true", default=False, help="Enable verbose mode")
 parser.add_argument("--port", type=int, default=7860, help="Port to run the web UI on")
-parser.add_argument("--host", type=str, default="0.0.0.0", help="Host to run the web UI on")
-parser.add_argument("--model_dir", type=str, default="./checkpoints", help="Model checkpoints directory")
-parser.add_argument("--fp16", action="store_true", default=False, help="Use FP16 for inference if available")
-parser.add_argument("--deepspeed", action="store_true", default=False, help="Use DeepSpeed to accelerate if available")
-parser.add_argument("--cuda_kernel", action="store_true", default=False, help="Use CUDA kernel for inference if available")
-parser.add_argument("--gui_seg_tokens", type=int, default=120, help="GUI: Max tokens per generation segment")
+parser.add_argument("--host", type=str, default="0.0.0.0", help="Host to run the web UI on (0.0.0.0 for Docker)")
+parser.add_argument("--model_dir", type=str, default="checkpoints", help="Model checkpoints directory")
+parser.add_argument("--share", action="store_true", default=False, help="Create a publicly shareable link")
 cmd_args = parser.parse_args()
 
+print("🚀 IndexTTS WebUI (统一版本)")
+print("=" * 50)
+
+# 检查模型文件
 if not os.path.exists(cmd_args.model_dir):
-    print(f"Model directory {cmd_args.model_dir} does not exist. Please download the model first.")
+    print(f"❌ 模型目录 {cmd_args.model_dir} 不存在。请先下载模型。")
     sys.exit(1)
 
-for file in [
+required_files = [
     "bpe.model",
     "gpt.pth",
     "config.yaml",
     "s2mel.pth",
-    "wav2vec2bert_stats.pt"
-]:
+    "wav2vec2bert_stats.pt",
+]
+
+missing_files = []
+for file in required_files:
     file_path = os.path.join(cmd_args.model_dir, file)
     if not os.path.exists(file_path):
-        print(f"Required file {file_path} does not exist. Please download it.")
-        sys.exit(1)
+        missing_files.append(file_path)
+
+if missing_files:
+    print("❌ 缺少必需文件:")
+    for file in missing_files:
+        print(f"   - {file}")
+    print("\n请确保所有模型文件都已下载到 checkpoints 目录")
+    sys.exit(1)
+
+print("✅ 模型文件检查通过")
+
+# 检查 GPU
+try:
+    import torch
+    if torch.cuda.is_available():
+        gpu_count = torch.cuda.device_count()
+        gpu_name = torch.cuda.get_device_name(0)
+        print(f"🎮 检测到 {gpu_count} 个 GPU: {gpu_name}")
+    else:
+        print("⚠️  未检测到 GPU，将使用 CPU 模式")
+except Exception as e:
+    print(f"⚠️  GPU 检查失败: {e}")
 
 import gradio as gr
-from indextts.infer_v2 import IndexTTS2
-from tools.i18n.i18n import I18nAuto
 
-i18n = I18nAuto(language="Auto")
-MODE = 'local'
-tts = IndexTTS2(model_dir=cmd_args.model_dir,
-                cfg_path=os.path.join(cmd_args.model_dir, "config.yaml"),
-                use_fp16=cmd_args.fp16,
-                use_deepspeed=cmd_args.deepspeed,
-                use_cuda_kernel=cmd_args.cuda_kernel,
-                )
-# 支持的语言列表
-LANGUAGES = {
-    "中文": "zh_CN",
-    "English": "en_US"
-}
-EMO_CHOICES_ALL = [i18n("与音色参考音频相同"),
-                i18n("使用情感参考音频"),
-                i18n("使用情感向量控制"),
-                i18n("使用情感描述文本控制")]
-EMO_CHOICES_OFFICIAL = EMO_CHOICES_ALL[:-1]  # skip experimental features
+try:
+    from indextts.infer_v2 import IndexTTS2
+    print("✅ IndexTTS2 导入成功")
+except ImportError as e:
+    print(f"❌ IndexTTS2 导入失败: {e}")
+    sys.exit(1)
 
-os.makedirs("outputs/tasks",exist_ok=True)
-os.makedirs("prompts",exist_ok=True)
+# 尝试导入 i18n，如果失败则使用简单的替代方案
+try:
+    from tools.i18n.i18n import I18nAuto
+    i18n = I18nAuto(language="zh_CN")
+    print("✅ i18n 模块加载成功")
+except ImportError:
+    print("⚠️  i18n 模块导入失败，使用默认语言")
+    class SimpleI18n:
+        def __call__(self, text):
+            return text
+    i18n = SimpleI18n()
 
-MAX_LENGTH_TO_USE_SPEED = 70
+# 任务状态枚举
+@dataclass
+class TaskStatus:
+    QUEUED = "queued"      # 排队中
+    RUNNING = "running"    # 执行中
+    COMPLETED = "completed"  # 已完成
+    FAILED = "failed"      # 失败
+
+@dataclass
+class Task:
+    """任务数据结构"""
+    id: str
+    prompt: str
+    text: str
+    infer_mode: str
+    params: Dict[str, Any]
+    status: str = TaskStatus.QUEUED
+    created_time: float = 0
+    start_time: float = 0
+    end_time: float = 0
+    result_path: Optional[str] = None
+    error_message: Optional[str] = None
+    
+    def __post_init__(self):
+        if self.created_time == 0:
+            self.created_time = time.time()
+
+class TaskQueue:
+    """任务队列管理器"""
+    
+    def __init__(self, max_history=50):
+        self.queue = queue.Queue()
+        self.current_task: Optional[Task] = None
+        self.task_history: deque = deque(maxlen=max_history)
+        self.execution_times: deque = deque(maxlen=20)  # 保存最近20次执行时间用于预估
+        self.worker_thread = None
+        self.is_running = False
+        self.lock = threading.Lock()
+        
+    def start_worker(self, tts_instance):
+        """启动队列处理工作线程"""
+        if self.worker_thread is None or not self.worker_thread.is_alive():
+            self.is_running = True
+            self.worker_thread = threading.Thread(target=self._worker, args=(tts_instance,), daemon=True)
+            self.worker_thread.start()
+            
+    def stop_worker(self):
+        """停止队列处理工作线程"""
+        self.is_running = False
+        
+    def add_task(self, prompt: str, text: str, infer_mode: str, params: Dict[str, Any]) -> str:
+        """添加任务到队列"""
+        task = Task(
+            id=str(uuid.uuid4())[:8],
+            prompt=prompt,
+            text=text,
+            infer_mode=infer_mode,
+            params=params
+        )
+        
+        with self.lock:
+            self.queue.put(task)
+            
+        print(f"📝 任务 {task.id} 已加入队列")
+        return task.id
+        
+    def get_queue_status(self) -> Dict[str, Any]:
+        """获取队列状态信息"""
+        with self.lock:
+            queue_size = self.queue.qsize()
+            current_task_info = None
+            
+            if self.current_task:
+                elapsed = time.time() - self.current_task.start_time
+                estimated_remaining = self._estimate_remaining_time()
+                current_task_info = {
+                    'id': self.current_task.id,
+                    'text_preview': self.current_task.text[:50] + ('...' if len(self.current_task.text) > 50 else ''),
+                    'elapsed_time': elapsed,
+                    'estimated_remaining': estimated_remaining
+                }
+                
+            return {
+                'queue_size': queue_size,
+                'current_task': current_task_info,
+                'total_completed': len([t for t in self.task_history if t.status == TaskStatus.COMPLETED]),
+                'average_execution_time': statistics.mean(self.execution_times) if self.execution_times else 0,
+                'estimated_wait_time': self._estimate_wait_time(queue_size)
+            }
+            
+    def get_task_result(self, task_id: str) -> Optional[Task]:
+        """根据任务ID获取任务结果"""
+        with self.lock:
+            # 检查当前任务
+            if self.current_task and self.current_task.id == task_id:
+                return self.current_task
+                
+            # 检查历史任务
+            for task in self.task_history:
+                if task.id == task_id:
+                    return task
+                    
+        return None
+        
+    def _worker(self, tts_instance):
+        """队列处理工作线程"""
+        print("🔄 队列处理器已启动")
+        
+        while self.is_running:
+            try:
+                # 等待任务，超时检查是否需要停止
+                task = self.queue.get(timeout=1)
+                
+                with self.lock:
+                    self.current_task = task
+                    task.status = TaskStatus.RUNNING
+                    task.start_time = time.time()
+                
+                print(f"🚀 开始执行任务 {task.id}")
+                
+                try:
+                    # 执行任务
+                    output_path = os.path.join("outputs", f"task_{task.id}_{int(time.time())}.wav")
+
+                    # IndexTTS2 统一使用 infer 方法
+                    # 过滤掉不支持的参数
+                    infer_params = {k: v for k, v in task.params.items()
+                                  if k not in ['sentences_bucket_max_size']}
+                    # 重命名参数以匹配 IndexTTS2 API
+                    if 'max_text_tokens_per_sentence' in infer_params:
+                        infer_params['max_text_tokens_per_segment'] = infer_params.pop('max_text_tokens_per_sentence')
+
+                    result = tts_instance.infer(
+                        spk_audio_prompt=task.prompt,
+                        text=task.text,
+                        output_path=output_path,
+                        verbose=cmd_args.verbose,
+                        **infer_params
+                    )
+                    
+                    # 任务完成
+                    with self.lock:
+                        task.status = TaskStatus.COMPLETED
+                        task.end_time = time.time()
+                        task.result_path = result
+                        
+                        # 记录执行时间用于预估
+                        execution_time = task.end_time - task.start_time
+                        self.execution_times.append(execution_time)
+                        
+                        # 移动到历史记录
+                        self.task_history.append(task)
+                        self.current_task = None
+                        
+                    print(f"✅ 任务 {task.id} 完成，耗时 {execution_time:.2f} 秒")
+                    
+                except Exception as e:
+                    # 任务失败
+                    with self.lock:
+                        task.status = TaskStatus.FAILED
+                        task.end_time = time.time()
+                        task.error_message = str(e)
+                        
+                        # 移动到历史记录
+                        self.task_history.append(task)
+                        self.current_task = None
+                        
+                    print(f"❌ 任务 {task.id} 失败: {e}")
+                    
+                finally:
+                    self.queue.task_done()
+                    
+            except queue.Empty:
+                continue
+            except Exception as e:
+                print(f"❌ 队列处理器错误: {e}")
+                
+        print("🛑 队列处理器已停止")
+        
+    def _estimate_remaining_time(self) -> float:
+        """预估当前任务剩余时间"""
+        if not self.current_task or not self.execution_times:
+            return 0
+            
+        avg_time = statistics.mean(self.execution_times)
+        elapsed = time.time() - self.current_task.start_time
+        return max(0, avg_time - elapsed)
+        
+    def _estimate_wait_time(self, queue_size: int) -> float:
+        """预估排队等待时间"""
+        if queue_size == 0 or not self.execution_times:
+            return 0
+            
+        avg_time = statistics.mean(self.execution_times)
+        current_remaining = self._estimate_remaining_time()
+        return current_remaining + (queue_size * avg_time)
+
+# 全局队列实例
+task_queue = TaskQueue()
+
+print("🔧 正在初始化 IndexTTS2...")
+try:
+    # 导入GPU优化配置
+    from gpu_configs import GPUOptimizer
+    gpu_config = GPUOptimizer.get_gpu_config()
+
+    # 打印GPU配置信息
+    GPUOptimizer.print_gpu_info(gpu_config)
+
+    tts = IndexTTS2(
+        model_dir=cmd_args.model_dir,
+        cfg_path=os.path.join(cmd_args.model_dir, "config.yaml"),
+        use_fp16=gpu_config['use_fp16'],
+        use_cuda_kernel=gpu_config['use_cuda_kernel']
+    )
+    print("✅ IndexTTS2 初始化成功")
+    
+    # 启动队列处理器
+    task_queue.start_worker(tts)
+    
+except Exception as e:
+    print(f"❌ IndexTTS2 初始化失败: {e}")
+    import traceback
+    traceback.print_exc()
+    sys.exit(1)
+
+# 创建输出目录
+os.makedirs("outputs", exist_ok=True)
+os.makedirs("outputs/tasks", exist_ok=True)
+os.makedirs("prompts", exist_ok=True)
+os.makedirs("logs", exist_ok=True)
+
+# 扫描demos目录获取音频文件
+def scan_demos_directory():
+    """扫描demos目录，返回分类和音频文件的字典"""
+    demos_dir = "demos"
+    if not os.path.exists(demos_dir):
+        if cmd_args.verbose:
+            print(f"⚠️  demos目录不存在: {demos_dir}")
+        return {}
+    
+    demos_dict = {}
+    
+    try:
+        # 遍历一级目录（分类）
+        for category in os.listdir(demos_dir):
+            category_path = os.path.join(demos_dir, category)
+            if not os.path.isdir(category_path) or category.startswith('.'):
+                continue
+                
+            if cmd_args.verbose:
+                print(f"📁 扫描分类: {category}")
+            demos_dict[category] = {}
+            
+            # 遍历二级目录（子分类）
+            for subcategory in os.listdir(category_path):
+                subcategory_path = os.path.join(category_path, subcategory)
+                if not os.path.isdir(subcategory_path) or subcategory.startswith('.'):
+                    continue
+                    
+                if cmd_args.verbose:
+                    print(f"  📂 扫描子分类: {category}/{subcategory}")
+                
+                # 查找wav文件
+                wav_files = glob.glob(os.path.join(subcategory_path, "*.wav"))
+                if wav_files:
+                    demos_dict[category][subcategory] = []
+                    for wav_file in sorted(wav_files):
+                        filename = os.path.basename(wav_file)
+                        if cmd_args.verbose:
+                            print(f"    🎵 发现音频: {filename}")
+                        demos_dict[category][subcategory].append({
+                            'name': filename,
+                            'path': wav_file
+                        })
+                else:
+                    if cmd_args.verbose:
+                        print(f"    ⚠️  {category}/{subcategory} 目录中未找到WAV文件")
+    
+    except Exception as e:
+        print(f"❌ 扫描demos目录失败: {e}")
+        if cmd_args.verbose:
+            import traceback
+            traceback.print_exc()
+    
+    return demos_dict
+
+def get_demo_categories():
+    """获取demos分类列表（动态扫描）"""
+    demos_dict = scan_demos_directory()
+    return list(demos_dict.keys())
+
+def get_demo_subcategories(category):
+    """根据分类获取子分类列表（动态扫描）"""
+    demos_dict = scan_demos_directory()
+    if category in demos_dict:
+        return list(demos_dict[category].keys())
+    return []
+
+def get_demo_audio_files(category, subcategory):
+    """根据分类和子分类获取音频文件列表（动态扫描）"""
+    demos_dict = scan_demos_directory()
+    if category in demos_dict and subcategory in demos_dict[category]:
+        return [audio['name'] for audio in demos_dict[category][subcategory]]
+    return []
+
+def get_demo_audio_path(category, subcategory, filename):
+    """获取指定音频文件的完整路径（动态扫描）"""
+    demos_dict = scan_demos_directory()
+    if category in demos_dict and subcategory in demos_dict[category]:
+        for audio in demos_dict[category][subcategory]:
+            if audio['name'] == filename:
+                return audio['path']
+    return None
+
+def get_demos_statistics():
+    """获取demos统计信息（动态扫描）"""
+    demos_dict = scan_demos_directory()
+    total_categories = len(demos_dict)
+    total_files = sum(len(files) for subcats in demos_dict.values() for files in subcats.values())
+    return total_categories, total_files, demos_dict
+
+# 加载示例案例（如果存在）
 example_cases = []
-with open("examples/cases.jsonl", "r", encoding="utf-8") as f:
-    for line in f:
-        line = line.strip()
-        if not line:
-            continue
-        example = json.loads(line)
-        if example.get("emo_audio",None):
-            emo_audio_path = os.path.join("examples",example["emo_audio"])
-        else:
-            emo_audio_path = None
+if os.path.exists("tests/cases.jsonl"):
+    try:
+        with open("tests/cases.jsonl", "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                example = json.loads(line)
+                # 移除参考音频，只保留文本和推理模式
+                example_cases.append([
+                    example.get("text"), 
+                    ["普通推理", "批次推理"][example.get("infer_mode", 0)]
+                ])
+        print(f"✅ 加载了 {len(example_cases)} 个示例案例")
+    except Exception as e:
+        print(f"⚠️  加载示例案例失败: {e}")
 
-        example_cases.append([os.path.join("examples", example.get("prompt_audio", "sample_prompt.wav")),
-                              EMO_CHOICES_ALL[example.get("emo_mode",0)],
-                              example.get("text"),
-                             emo_audio_path,
-                             example.get("emo_weight",1.0),
-                             example.get("emo_text",""),
-                             example.get("emo_vec_1",0),
-                             example.get("emo_vec_2",0),
-                             example.get("emo_vec_3",0),
-                             example.get("emo_vec_4",0),
-                             example.get("emo_vec_5",0),
-                             example.get("emo_vec_6",0),
-                             example.get("emo_vec_7",0),
-                             example.get("emo_vec_8",0),
-                             ])
+# 导入显存监控
+from memory_monitor import GPUMemoryMonitor
 
-def get_example_cases(include_experimental = False):
-    if include_experimental:
-        return example_cases  # show every example
+# 初始化显存监控器
+memory_monitor = GPUMemoryMonitor(
+    threshold_percent=float(os.environ.get('GPU_MEMORY_THRESHOLD', 90)),
+    force_gc_threshold=float(os.environ.get('GPU_MEMORY_FORCE_GC_THRESHOLD', 95)),
+    check_interval=int(os.environ.get('GPU_MEMORY_CHECK_INTERVAL', 300))
+)
 
-    # exclude emotion control mode 3 (emotion from text description)
-    return [x for x in example_cases if x[1] != EMO_CHOICES_ALL[3]]
+def gen_single_with_queue(prompt, text, infer_mode, max_text_tokens_per_segment=120,
+                         *args, progress=gr.Progress()):
+    """使用队列的语音生成函数"""
+    if not prompt:
+        gr.Warning("请上传参考音频文件或选择预设音频")
+        return gr.update(value=None, visible=True), "请上传参考音频"
 
-def gen_single(emo_control_method,prompt, text,
-               emo_ref_path, emo_weight,
-               vec1, vec2, vec3, vec4, vec5, vec6, vec7, vec8,
-               emo_text,emo_random,
-               max_text_tokens_per_segment=120,
-                *args, progress=gr.Progress()):
-    output_path = None
-    if not output_path:
-        output_path = os.path.join("outputs", f"spk_{int(time.time())}.wav")
-    # set gradio progress
-    tts.gr_progress = progress
+    if not text or not text.strip():
+        gr.Warning("请输入要合成的文本")
+        return gr.update(value=None, visible=True), "请输入要合成的文本"
+
+    # 检查显存状态
+    if memory_monitor:
+        usage = memory_monitor.get_memory_usage()
+        if usage > 95:  # 如果显存使用率超过95%，强制清理
+            gr.Warning("显存使用率过高，正在进行强制清理...")
+            memory_monitor.clean_memory(force=True)
+            time.sleep(1)  # 等待清理完成
+        elif usage > 85:  # 如果显存使用率超过85%，尝试清理
+            gr.Info("正在进行显存清理...")
+            memory_monitor.clean_memory()
+
+    # 解析参数
     do_sample, top_p, top_k, temperature, \
         length_penalty, num_beams, repetition_penalty, max_mel_tokens = args
-    kwargs = {
+
+    params = {
         "do_sample": bool(do_sample),
         "top_p": float(top_p),
         "top_k": int(top_k) if int(top_k) > 0 else None,
         "temperature": float(temperature),
         "length_penalty": float(length_penalty),
-        "num_beams": num_beams,
+        "num_beams": int(num_beams),
         "repetition_penalty": float(repetition_penalty),
         "max_mel_tokens": int(max_mel_tokens),
-        # "typical_sampling": bool(typical_sampling),
-        # "typical_mass": float(typical_mass),
+        "max_text_tokens_per_segment": int(max_text_tokens_per_segment),
     }
-    if type(emo_control_method) is not int:
-        emo_control_method = emo_control_method.value
-    if emo_control_method == 0:  # emotion from speaker
-        emo_ref_path = None  # remove external reference audio
-    if emo_control_method == 1:  # emotion from reference audio
-        pass
-    if emo_control_method == 2:  # emotion from custom vectors
-        vec = [vec1, vec2, vec3, vec4, vec5, vec6, vec7, vec8]
-        vec = tts.normalize_emo_vec(vec, apply_bias=True)
+    
+    # 添加任务到队列
+    task_id = task_queue.add_task(prompt, text, infer_mode, params)
+    
+    gr.Info(f"🎯 任务 {task_id} 已提交到队列")
+    
+    # 轮询等待任务完成
+    max_wait_time = 300  # 最大等待5分钟
+    start_wait = time.time()
+    
+    while time.time() - start_wait < max_wait_time:
+        task = task_queue.get_task_result(task_id)
+        
+        if task and task.status == TaskStatus.COMPLETED:
+            # 任务完成后主动清理显存
+            if memory_monitor:
+                memory_monitor.clean_memory()
+            gr.Info(f"✅ 任务 {task_id} 完成！")
+            return gr.update(value=task.result_path, visible=True), f"任务 {task_id} 已完成"
+        elif task and task.status == TaskStatus.FAILED:
+            # 任务失败后主动清理显存
+            if memory_monitor:
+                memory_monitor.clean_memory(force=True)
+            gr.Error(f"❌ 任务 {task_id} 失败: {task.error_message}")
+            return gr.update(value=None, visible=True), f"任务失败: {task.error_message}"
+        
+        # 更新进度信息
+        if task and task.status == TaskStatus.RUNNING:
+            elapsed = time.time() - task.start_time
+            progress(0.5, f"任务 {task_id} 执行中... ({elapsed:.1f}s)")
+        else:
+            queue_status = task_queue.get_queue_status()
+            if queue_status['queue_size'] > 0:
+                progress(0.1, f"排队中... 前面还有 {queue_status['queue_size']} 个任务")
+        
+        time.sleep(1)
+    
+    gr.Error(f"❌ 任务 {task_id} 超时")
+    return gr.update(value=None, visible=True), "任务超时"
+
+def get_queue_status_display():
+    """获取队列状态显示信息"""
+    status = task_queue.get_queue_status()
+    
+    if status['current_task']:
+        current_info = status['current_task']
+        current_text = f"""
+        🔄 **当前执行任务**
+        - 任务ID: {current_info['id']}
+        - 内容预览: {current_info['text_preview']}
+        - 已执行时间: {current_info['elapsed_time']:.1f}s
+        - 预估剩余: {current_info['estimated_remaining']:.1f}s
+        """
     else:
-        # don't use the emotion vector inputs for the other modes
-        vec = None
+        current_text = "💤 **当前无任务执行**"
+    
+    queue_info = f"""
+    📊 **队列状态**
+    - 排队任务数: {status['queue_size']}
+    - 已完成任务: {status['total_completed']}
+    - 平均执行时间: {status['average_execution_time']:.1f}s
+    - 预估等待时间: {status['estimated_wait_time']:.1f}s
+    """
+    
+    return current_text + "\n" + queue_info
 
-    if emo_text == "":
-        # erase empty emotion descriptions; `infer()` will then automatically use the main prompt
-        emo_text = None
-
-    print(f"Emo control mode:{emo_control_method},weight:{emo_weight},vec:{vec}")
-    output = tts.infer(spk_audio_prompt=prompt, text=text,
-                       output_path=output_path,
-                       emo_audio_prompt=emo_ref_path, emo_alpha=emo_weight,
-                       emo_vector=vec,
-                       use_emo_text=(emo_control_method==3), emo_text=emo_text,use_random=emo_random,
-                       verbose=cmd_args.verbose,
-                       max_text_tokens_per_segment=int(max_text_tokens_per_segment),
-                       **kwargs)
-    return gr.update(value=output,visible=True)
+def refresh_queue_status():
+    """刷新队列状态"""
+    return get_queue_status_display()
 
 def update_prompt_audio():
-    update_button = gr.update(interactive=True)
-    return update_button
+    """更新提示音频按钮状态"""
+    return gr.update(interactive=True)
 
-def create_warning_message(warning_text):
-    return gr.HTML(f"<div style=\"padding: 0.5em 0.8em; border-radius: 0.5em; background: #ffa87d; color: #000; font-weight: bold\">{html.escape(warning_text)}</div>")
-
-def create_experimental_warning_message():
-    return create_warning_message(i18n('提示：此功能为实验版，结果尚不稳定，我们正在持续优化中。'))
-
-with gr.Blocks(title="IndexTTS Demo") as demo:
-    mutex = threading.Lock()
-    gr.HTML('''
-    <h2><center>IndexTTS2: A Breakthrough in Emotionally Expressive and Duration-Controlled Auto-Regressive Zero-Shot Text-to-Speech</h2>
-<p align="center">
-<a href='https://arxiv.org/abs/2506.21619'><img src='https://img.shields.io/badge/ArXiv-2506.21619-red'></a>
-</p>
-    ''')
-
-    with gr.Tab(i18n("音频生成")):
-        with gr.Row():
-            os.makedirs("prompts",exist_ok=True)
-            prompt_audio = gr.Audio(label=i18n("音色参考音频"),key="prompt_audio",
-                                    sources=["upload","microphone"],type="filepath")
-            prompt_list = os.listdir("prompts")
-            default = ''
-            if prompt_list:
-                default = prompt_list[0]
-            with gr.Column():
-                input_text_single = gr.TextArea(label=i18n("文本"),key="input_text_single", placeholder=i18n("请输入目标文本"), info=f"{i18n('当前模型版本')}{tts.model_version or '1.0'}")
-                gen_button = gr.Button(i18n("生成语音"), key="gen_button",interactive=True)
-            output_audio = gr.Audio(label=i18n("生成结果"), visible=True,key="output_audio")
-
-        experimental_checkbox = gr.Checkbox(label=i18n("显示实验功能"), value=False)
-
-        with gr.Accordion(i18n("功能设置")):
-            # 情感控制选项部分
-            with gr.Row():
-                emo_control_method = gr.Radio(
-                    choices=EMO_CHOICES_OFFICIAL,
-                    type="index",
-                    value=EMO_CHOICES_OFFICIAL[0],label=i18n("情感控制方式"))
-                # we MUST have an extra, INVISIBLE list of *all* emotion control
-                # methods so that gr.Dataset() can fetch ALL control mode labels!
-                # otherwise, the gr.Dataset()'s experimental labels would be empty!
-                emo_control_method_all = gr.Radio(
-                    choices=EMO_CHOICES_ALL,
-                    type="index",
-                    value=EMO_CHOICES_ALL[0], label=i18n("情感控制方式"),
-                    visible=False)  # do not render
-        # 情感参考音频部分
-        with gr.Group(visible=False) as emotion_reference_group:
-            with gr.Row():
-                emo_upload = gr.Audio(label=i18n("上传情感参考音频"), type="filepath")
-
-        # 情感随机采样
-        with gr.Row(visible=False) as emotion_randomize_group:
-            emo_random = gr.Checkbox(label=i18n("情感随机采样"), value=False)
-
-        # 情感向量控制部分
-        with gr.Group(visible=False) as emotion_vector_group:
-            with gr.Row():
-                with gr.Column():
-                    vec1 = gr.Slider(label=i18n("喜"), minimum=0.0, maximum=1.0, value=0.0, step=0.05)
-                    vec2 = gr.Slider(label=i18n("怒"), minimum=0.0, maximum=1.0, value=0.0, step=0.05)
-                    vec3 = gr.Slider(label=i18n("哀"), minimum=0.0, maximum=1.0, value=0.0, step=0.05)
-                    vec4 = gr.Slider(label=i18n("惧"), minimum=0.0, maximum=1.0, value=0.0, step=0.05)
-                with gr.Column():
-                    vec5 = gr.Slider(label=i18n("厌恶"), minimum=0.0, maximum=1.0, value=0.0, step=0.05)
-                    vec6 = gr.Slider(label=i18n("低落"), minimum=0.0, maximum=1.0, value=0.0, step=0.05)
-                    vec7 = gr.Slider(label=i18n("惊喜"), minimum=0.0, maximum=1.0, value=0.0, step=0.05)
-                    vec8 = gr.Slider(label=i18n("平静"), minimum=0.0, maximum=1.0, value=0.0, step=0.05)
-
-        with gr.Group(visible=False) as emo_text_group:
-            create_experimental_warning_message()
-            with gr.Row():
-                emo_text = gr.Textbox(label=i18n("情感描述文本"),
-                                      placeholder=i18n("请输入情绪描述（或留空以自动使用目标文本作为情绪描述）"),
-                                      value="",
-                                      info=i18n("例如：委屈巴巴、危险在悄悄逼近"))
-
-        with gr.Row(visible=False) as emo_weight_group:
-            emo_weight = gr.Slider(label=i18n("情感权重"), minimum=0.0, maximum=1.0, value=0.65, step=0.01)
-
-        with gr.Accordion(i18n("高级生成参数设置"), open=False, visible=True) as advanced_settings_group:
-            with gr.Row():
-                with gr.Column(scale=1):
-                    gr.Markdown(f"**{i18n('GPT2 采样设置')}** _{i18n('参数会影响音频多样性和生成速度详见')} [Generation strategies](https://huggingface.co/docs/transformers/main/en/generation_strategies)._")
-                    with gr.Row():
-                        do_sample = gr.Checkbox(label="do_sample", value=True, info=i18n("是否进行采样"))
-                        temperature = gr.Slider(label="temperature", minimum=0.1, maximum=2.0, value=0.8, step=0.1)
-                    with gr.Row():
-                        top_p = gr.Slider(label="top_p", minimum=0.0, maximum=1.0, value=0.8, step=0.01)
-                        top_k = gr.Slider(label="top_k", minimum=0, maximum=100, value=30, step=1)
-                        num_beams = gr.Slider(label="num_beams", value=3, minimum=1, maximum=10, step=1)
-                    with gr.Row():
-                        repetition_penalty = gr.Number(label="repetition_penalty", precision=None, value=10.0, minimum=0.1, maximum=20.0, step=0.1)
-                        length_penalty = gr.Number(label="length_penalty", precision=None, value=0.0, minimum=-2.0, maximum=2.0, step=0.1)
-                    max_mel_tokens = gr.Slider(label="max_mel_tokens", value=1500, minimum=50, maximum=tts.cfg.gpt.max_mel_tokens, step=10, info=i18n("生成Token最大数量，过小导致音频被截断"), key="max_mel_tokens")
-                    # with gr.Row():
-                    #     typical_sampling = gr.Checkbox(label="typical_sampling", value=False, info="不建议使用")
-                    #     typical_mass = gr.Slider(label="typical_mass", value=0.9, minimum=0.0, maximum=1.0, step=0.1)
-                with gr.Column(scale=2):
-                    gr.Markdown(f'**{i18n("分句设置")}** _{i18n("参数会影响音频质量和生成速度")}_')
-                    with gr.Row():
-                        initial_value = max(20, min(tts.cfg.gpt.max_text_tokens, cmd_args.gui_seg_tokens))
-                        max_text_tokens_per_segment = gr.Slider(
-                            label=i18n("分句最大Token数"), value=initial_value, minimum=20, maximum=tts.cfg.gpt.max_text_tokens, step=2, key="max_text_tokens_per_segment",
-                            info=i18n("建议80~200之间，值越大，分句越长；值越小，分句越碎；过小过大都可能导致音频质量不高"),
-                        )
-                    with gr.Accordion(i18n("预览分句结果"), open=True) as segments_settings:
-                        segments_preview = gr.Dataframe(
-                            headers=[i18n("序号"), i18n("分句内容"), i18n("Token数")],
-                            key="segments_preview",
-                            wrap=True,
-                        )
-            advanced_params = [
-                do_sample, top_p, top_k, temperature,
-                length_penalty, num_beams, repetition_penalty, max_mel_tokens,
-                # typical_sampling, typical_mass,
-            ]
-
-        # we must use `gr.Dataset` to support dynamic UI rewrites, since `gr.Examples`
-        # binds tightly to UI and always restores the initial state of all components,
-        # such as the list of available choices in emo_control_method.
-        example_table = gr.Dataset(label="Examples",
-            samples_per_page=20,
-            samples=get_example_cases(include_experimental=False),
-            type="values",
-            # these components are NOT "connected". it just reads the column labels/available
-            # states from them, so we MUST link to the "all options" versions of all components,
-            # such as `emo_control_method_all` (to be able to see EXPERIMENTAL text labels)!
-            components=[prompt_audio,
-                        emo_control_method_all,  # important: support all mode labels!
-                        input_text_single,
-                        emo_upload,
-                        emo_weight,
-                        emo_text,
-                        vec1, vec2, vec3, vec4, vec5, vec6, vec7, vec8]
-        )
-
-    def on_example_click(example):
-        print(f"Example clicked: ({len(example)} values) = {example!r}")
-        return (
-            gr.update(value=example[0]),
-            gr.update(value=example[1]),
-            gr.update(value=example[2]),
-            gr.update(value=example[3]),
-            gr.update(value=example[4]),
-            gr.update(value=example[5]),
-            gr.update(value=example[6]),
-            gr.update(value=example[7]),
-            gr.update(value=example[8]),
-            gr.update(value=example[9]),
-            gr.update(value=example[10]),
-            gr.update(value=example[11]),
-            gr.update(value=example[12]),
-            gr.update(value=example[13]),
-        )
-
-    # click() event works on both desktop and mobile UI
-    example_table.click(on_example_click,
-                        inputs=[example_table],
-                        outputs=[prompt_audio,
-                                 emo_control_method,
-                                 input_text_single,
-                                 emo_upload,
-                                 emo_weight,
-                                 emo_text,
-                                 vec1, vec2, vec3, vec4, vec5, vec6, vec7, vec8]
-    )
-
-    def on_input_text_change(text, max_text_tokens_per_segment):
-        if text and len(text) > 0:
+def on_input_text_change(text, max_tokens_per_segment):
+    """文本输入变化时的回调函数"""
+    if text and len(text.strip()) > 0:
+        try:
             text_tokens_list = tts.tokenizer.tokenize(text)
+            segments = tts.tokenizer.split_segments(
+                text_tokens_list,
+                max_text_tokens_per_segment=int(max_tokens_per_segment)
+            )
 
-            segments = tts.tokenizer.split_segments(text_tokens_list, max_text_tokens_per_segment=int(max_text_tokens_per_segment))
             data = []
             for i, s in enumerate(segments):
                 segment_str = ''.join(s)
                 tokens_count = len(s)
-                data.append([i, segment_str, tokens_count])
-            return {
-                segments_preview: gr.update(value=data, visible=True, type="array"),
-            }
+                data.append([i + 1, segment_str, tokens_count])
+
+            return gr.update(value=data, visible=True)
+        except Exception as e:
+            print(f"⚠️  文本处理失败: {e}")
+            return gr.update(value=[], visible=True)
+    else:
+        return gr.update(value=[], visible=True)
+
+def on_demo_category_change(category):
+    """当demos分类改变时更新子分类选项"""
+    if category:
+        subcategories = get_demo_subcategories(category)
+        return gr.update(choices=subcategories, value=subcategories[0] if subcategories else None)
+    return gr.update(choices=[], value=None)
+
+def on_demo_subcategory_change(category, subcategory):
+    """当demos子分类改变时更新音频文件选项"""
+    if category and subcategory:
+        audio_files = get_demo_audio_files(category, subcategory)
+        return gr.update(choices=audio_files, value=audio_files[0] if audio_files else None)
+    return gr.update(choices=[], value=None)
+
+def on_demo_audio_select(category, subcategory, filename):
+    """当选择demos音频时更新音频组件"""
+    if category and subcategory and filename:
+        audio_path = get_demo_audio_path(category, subcategory, filename)
+        if audio_path and os.path.exists(audio_path):
+            return gr.update(value=audio_path)
+    return gr.update(value=None)
+
+def clear_text():
+    """清空目标文本框内容"""
+    return gr.update(value="")
+
+def auto_use_demo_audio(category, subcategory, filename):
+    """当音频文件被选中时自动使用该音频"""
+    if category and subcategory and filename:
+        audio_path = get_demo_audio_path(category, subcategory, filename)
+        if audio_path and os.path.exists(audio_path):
+            return gr.update(value=audio_path)
+    return gr.update(value=None)
+
+def get_recent_outputs(limit=10):
+    """从outputs目录获取最近生成的音频文件"""
+    try:
+        output_files = []
+        for file in sorted(glob.glob("outputs/*.wav"), key=os.path.getctime, reverse=True):
+            if len(output_files) >= limit:
+                break
+            
+            filename = os.path.basename(file)
+            # 获取文件信息
+            stat = os.stat(file)
+            output_files.append({
+                'filename': filename,
+                'path': file,
+                'size': stat.st_size,
+                'created': stat.st_ctime,
+                'modified': stat.st_mtime
+            })
+        return output_files
+    except Exception as e:
+        print(f"⚠️ 读取输出文件失败: {e}")
+        return []
+
+def format_time(timestamp):
+    """格式化时间戳"""
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(timestamp))
+
+def format_size(size):
+    """格式化文件大小"""
+    for unit in ['B', 'KB', 'MB']:
+        if size < 1024:
+            return f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} GB"
+
+def refresh_recent_outputs():
+    """刷新最近输出列表"""
+    outputs = get_recent_outputs()
+    if not outputs:
+        return [], gr.update(visible=False)
+    
+    # 准备表格数据
+    data = []
+    for output in outputs:
+        data.append([
+            output['filename'],
+            format_time(output['modified']),
+            format_size(output['size']),
+            output['path']
+        ])
+    
+    return data, gr.update(visible=True)
+
+# 创建 Gradio 界面
+with gr.Blocks(
+    title="IndexTTS Demo - 统一版本", 
+    theme=gr.themes.Soft(),
+    css="""
+    .gradio-container {
+        max-width: 1200px !important;
+    }
+    .header {
+        text-align: center;
+        margin-bottom: 20px;
+    }
+    
+    /* 默认样式 - 浅色主题 */
+    .demos-section {
+        border: 1px solid #e0e0e0 !important;
+        border-radius: 8px !important;
+        padding: 15px !important;
+        margin-bottom: 15px !important;
+        background-color: #f9f9f9 !important;
+        color: #333333 !important;
+    }
+    
+    .queue-status {
+        border: 1px solid #1976d2 !important;
+        border-radius: 8px !important;
+        padding: 15px !important;
+        margin-bottom: 15px !important;
+        background-color: #f3f9ff !important;
+        color: #0d47a1 !important;
+        transition: all 0.3s ease !important;
+    }
+    
+    /* 暗色主题覆盖样式 - 使用Gradio的.dark选择器 */
+    .dark .demos-section {
+        border: 1px solid #404040 !important;
+        background-color: #2a2a2a !important;
+        color: #e0e0e0 !important;
+    }
+    
+    .dark .queue-status {
+        border: 1px solid #64b5f6 !important;
+        background-color: #1a237e !important;
+        color: #bbdefb !important;
+    }
+    
+    /* 状态文本样式优化 */
+    .queue-status .markdown {
+        font-family: 'SF Mono', 'Monaco', 'Inconsolata', 'Roboto Mono', monospace !important;
+        line-height: 1.6 !important;
+    }
+    
+    .queue-status h3 {
+        margin-top: 0 !important;
+        margin-bottom: 10px !important;
+        font-weight: 600 !important;
+    }
+    
+    .queue-status strong {
+        font-weight: 700 !important;
+    }
+    
+    /* 按钮样式优化 */
+    .queue-refresh-btn {
+        background: linear-gradient(45deg, #2196f3, #21cbf3) !important;
+        border: none !important;
+        color: white !important;
+        font-weight: 500 !important;
+        transition: all 0.3s ease !important;
+    }
+    
+    .queue-refresh-btn:hover {
+        background: linear-gradient(45deg, #1976d2, #0288d1) !important;
+        transform: translateY(-1px) !important;
+        box-shadow: 0 4px 8px rgba(33, 150, 243, 0.3) !important;
+    }
+    
+    /* 系统自适应暗色主题检测 */
+    @media (prefers-color-scheme: dark) {
+        .demos-section {
+            border: 1px solid #404040 !important;
+            background-color: #2a2a2a !important;
+            color: #e0e0e0 !important;
+        }
+        .queue-status {
+            border: 1px solid #64b5f6 !important;
+            background-color: #1a237e !important;
+            color: #bbdefb !important;
+        }
+    }
+    
+    /* 高对比度模式支持 */
+    @media (prefers-contrast: high) {
+        .queue-status {
+            border-width: 2px !important;
+            font-weight: 600 !important;
+        }
+    }
+    
+    /* 移动端适配 */
+    @media (max-width: 768px) {
+        .gradio-container {
+            max-width: 100% !important;
+            padding: 10px !important;
+        }
+        .queue-status {
+            padding: 10px !important;
+            margin-bottom: 10px !important;
+        }
+    }
+    
+    /* 最近输出表格样式 */
+    .recent-outputs {
+        margin-top: 20px;
+    }
+    
+    .recent-outputs table {
+        width: 100%;
+        border-collapse: collapse;
+    }
+    
+    .recent-outputs th,
+    .recent-outputs td {
+        padding: 12px;
+        text-align: left;
+        border-bottom: 1px solid #ddd;
+    }
+    
+    .dark .recent-outputs th,
+    .dark .recent-outputs td {
+        border-bottom: 1px solid #444;
+    }
+    
+    .recent-outputs tr:hover {
+        background-color: rgba(0, 0, 0, 0.05);
+    }
+    
+    .dark .recent-outputs tr:hover {
+        background-color: rgba(255, 255, 255, 0.05);
+    }
+    """
+) as demo:
+    mutex = threading.Lock()
+    
+    gr.HTML('''
+    <div class="header">
+        <h1>🎤 IndexTTS: 工业级零样本文本转语音系统</h1>
+        <h3>IndexTTS: An Industrial-Level Controllable and Efficient Zero-Shot TTS System</h3>
+        <p>
+            <a href='https://arxiv.org/abs/2502.05512'><img src='https://img.shields.io/badge/ArXiv-2502.05512-red'></a>
+            <img src='https://img.shields.io/badge/Status-Fixed-green'>
+            <img src='https://img.shields.io/badge/Docker-Supported-blue'>
+            <img src='https://img.shields.io/badge/Demos-Enabled-orange'>
+            <img src='https://img.shields.io/badge/Queue-Enabled-purple'>
+        </p>
+        <p><strong>✅ 已修复 bitsandbytes 兼容性问题 | 支持 Docker 部署 | 🎵 支持预设音频选择 | 📋 智能队列管理</strong></p>
+    </div>
+    ''')
+    
+    with gr.Tab("🎵 音频生成"):
+        # 队列状态显示
+        with gr.Group(elem_classes=["queue-status"]):
+            gr.Markdown("### 📋 队列状态")
+            queue_status_display = gr.Markdown(
+                get_queue_status_display()
+            )
+            with gr.Row():
+                refresh_queue_btn = gr.Button("🔄 刷新状态", size="sm", elem_classes=["queue-refresh-btn"])
+                task_status_output = gr.Textbox(
+                    label="任务状态", 
+                    interactive=False,
+                    placeholder="任务状态将在这里显示..."
+                )
+        
+        with gr.Row():
+            with gr.Column(scale=1):
+                # 预设音频选择区域
+                if get_demo_categories():
+                    with gr.Group(elem_classes=["demos-section"]):
+                        gr.Markdown("### 🎭 选择预设音频")
+                        
+                        # 获取初始化值
+                        initial_categories = get_demo_categories()
+                        initial_category = initial_categories[0] if initial_categories else None
+                        initial_subcategories = get_demo_subcategories(initial_category) if initial_category else []
+                        initial_subcategory = initial_subcategories[0] if initial_subcategories else None
+                        initial_audio_files = get_demo_audio_files(initial_category, initial_subcategory) if initial_category and initial_subcategory else []
+                        initial_audio_file = initial_audio_files[0] if initial_audio_files else None
+                        
+                        with gr.Row():
+                            demo_category = gr.Dropdown(
+                                choices=initial_categories,
+                                label="分类",
+                                value=initial_category
+                            )
+                            demo_subcategory = gr.Dropdown(
+                                choices=initial_subcategories,
+                                label="子分类",
+                                value=initial_subcategory
+                            )
+                        demo_audio_file = gr.Dropdown(
+                            choices=initial_audio_files,
+                            label="音频文件",
+                            value=initial_audio_file
+                        )
+                        use_demo_btn = gr.Button("🎯 使用选中音频", variant="secondary", size="sm")
+                
+                gr.Markdown("### 📎 上传/录制音频")
+                prompt_audio = gr.Audio(
+                    label="参考音频", 
+                    sources=["upload", "microphone"],
+                    type="filepath"
+                )
+                
+            with gr.Column(scale=2):
+                with gr.Row():
+                    input_text_single = gr.TextArea(
+                        label="📝 目标文本",
+                        placeholder="请输入要合成的文本...",
+                        info=f"当前模型版本: {getattr(tts, 'model_version', None) or '1.0'}",
+                        lines=6,
+                        scale=4
+                    )
+                
+                with gr.Row():
+                    infer_mode = gr.Radio(
+                        choices=["普通推理", "批次推理"], 
+                        label="⚡ 推理模式",
+                        info="批次推理：更适合长句，性能翻倍",
+                        value="批次推理"
+                    )
+
+                with gr.Row():
+                    gen_button = gr.Button("🎯 提交到队列", variant="primary", size="lg")
+                    clear_text_btn = gr.Button("🗑️ 清空", variant="secondary", size="lg")
+        
+        output_audio = gr.Audio(label="🎵 生成结果", visible=True)
+        
+        # 高级参数设置
+        with gr.Accordion("⚙️ 高级参数设置", open=False):
+            with gr.Row():
+                with gr.Column(scale=1):
+                    gr.Markdown("**🎛️ GPT2 采样设置**")
+                    with gr.Row():
+                        do_sample = gr.Checkbox(label="启用采样", value=True)
+                        temperature = gr.Slider(
+                            label="温度", minimum=0.1, maximum=2.0, value=1.0, step=0.1
+                        )
+                    with gr.Row():
+                        top_p = gr.Slider(
+                            label="Top-p", minimum=0.0, maximum=1.0, value=0.8, step=0.01
+                        )
+                        top_k = gr.Slider(
+                            label="Top-k", minimum=0, maximum=100, value=30, step=1
+                        )
+                    with gr.Row():
+                        num_beams = gr.Slider(
+                            label="束搜索数量", value=3, minimum=1, maximum=10, step=1
+                        )
+                        repetition_penalty = gr.Number(
+                            label="重复惩罚", value=10.0, minimum=0.1, maximum=20.0, step=0.1
+                        )
+                    with gr.Row():
+                        length_penalty = gr.Number(
+                            label="长度惩罚", value=0.0, minimum=-2.0, maximum=2.0, step=0.1
+                        )
+                        max_mel_tokens = gr.Slider(
+                            label="最大Mel token数", 
+                            value=600, 
+                            minimum=50, 
+                            maximum=getattr(tts.cfg.gpt, 'max_mel_tokens', 1000), 
+                            step=10
+                        )
+                
+                with gr.Column(scale=1):
+                    gr.Markdown("**✂️ 分段设置**")
+                    max_text_tokens_per_segment = gr.Slider(
+                        label="分段最大Token数",
+                        value=120,
+                        minimum=20,
+                        maximum=getattr(tts.cfg.gpt, 'max_text_tokens', 300),
+                        step=2,
+                        info="建议80~200之间"
+                    )
+
+                    with gr.Accordion("📋 分段预览", open=True):
+                        segments_preview = gr.Dataframe(
+                            headers=["序号", "分段内容", "Token数"],
+                            wrap=True,
+                            interactive=False
+                        )
+        
+        # 示例案例
+        if len(example_cases) > 0:
+            gr.Examples(
+                examples=example_cases,
+                inputs=[input_text_single, infer_mode],  # 移除 prompt_audio
+                label="📚 示例案例"
+            )
+    
+    with gr.Tab("🎭 音频库管理"):
+        gr.Markdown("### 📁 Demos 音频库")
+        
+        # 显示当前音频库统计
+        total_categories, total_files, demos_audio_dict = get_demos_statistics()
+        
+        gr.Markdown(f"""
+        **📊 统计信息**
+        - 分类数量: {total_categories}
+        - 音频文件总数: {total_files}
+        """)
+        
+        # 显示音频库结构
+        if demos_audio_dict:
+            structure_md = "**📂 目录结构**\n\n"
+            for category, subcategories in demos_audio_dict.items():
+                structure_md += f"- **{category}**\n"
+                for subcategory, files in subcategories.items():
+                    structure_md += f"  - {subcategory} ({len(files)} 个文件)\n"
+                    for file_info in files[:3]:  # 只显示前3个文件
+                        structure_md += f"    - {file_info['name']}\n"
+                    if len(files) > 3:
+                        structure_md += f"    - ... 还有 {len(files) - 3} 个文件\n"
+            
+            gr.Markdown(structure_md)
         else:
-            df = pd.DataFrame([], columns=[i18n("序号"), i18n("分句内容"), i18n("Token数")])
-            return {
-                segments_preview: gr.update(value=df),
-            }
-
-    def on_method_change(emo_control_method):
-        if emo_control_method == 1:  # emotion reference audio
-            return (gr.update(visible=True),
-                    gr.update(visible=False),
-                    gr.update(visible=False),
-                    gr.update(visible=False),
-                    gr.update(visible=True)
-                    )
-        elif emo_control_method == 2:  # emotion vectors
-            return (gr.update(visible=False),
-                    gr.update(visible=True),
-                    gr.update(visible=True),
-                    gr.update(visible=False),
-                    gr.update(visible=True)
-                    )
-        elif emo_control_method == 3:  # emotion text description
-            return (gr.update(visible=False),
-                    gr.update(visible=True),
-                    gr.update(visible=False),
-                    gr.update(visible=True),
-                    gr.update(visible=True)
-                    )
-        else:  # 0: same as speaker voice
-            return (gr.update(visible=False),
-                    gr.update(visible=False),
-                    gr.update(visible=False),
-                    gr.update(visible=False),
-                    gr.update(visible=False)
-                    )
-
-    emo_control_method.change(on_method_change,
-        inputs=[emo_control_method],
-        outputs=[emotion_reference_group,
-                 emotion_randomize_group,
-                 emotion_vector_group,
-                 emo_text_group,
-                 emo_weight_group]
-    )
-
-    def on_experimental_change(is_experimental, current_mode_index):
-        # 切换情感控制选项
-        new_choices = EMO_CHOICES_ALL if is_experimental else EMO_CHOICES_OFFICIAL
-        # if their current mode selection doesn't exist in new choices, reset to 0.
-        # we don't verify that OLD index means the same in NEW list, since we KNOW it does.
-        new_index = current_mode_index if current_mode_index < len(new_choices) else 0
-
-        return (
-            gr.update(choices=new_choices, value=new_choices[new_index]),
-            gr.update(samples=get_example_cases(include_experimental=is_experimental)),
+            gr.Markdown("**⚠️ 未找到音频文件**\n\n请在 `demos/` 目录下添加音频文件。")
+        
+        gr.Markdown("""
+        ### 📝 添加音频文件
+        
+        1. **准备音频文件**
+           - 格式：WAV
+           - 采样率：22050Hz 或 44100Hz
+           - 时长：3-10秒
+           - 质量：清晰无噪音
+        
+        2. **文件命名**
+           - 中文：`说话人-内容描述.wav`
+           - 英文：`Speaker-Content.wav`
+           - 角色：`角色名-台词内容.wav`
+        
+        3. **放置文件**
+           - 将文件放入对应的分类目录
+           - 重启 WebUI 以刷新列表
+        """)
+    
+    with gr.Tab("ℹ️ 系统信息"):
+        with gr.Row():
+            with gr.Column():
+                gr.Markdown(f"""
+                ### 🖥️ 系统信息
+                - **Python 版本**: {sys.version}
+                - **工作目录**: {os.getcwd()}
+                - **模型目录**: {cmd_args.model_dir}
+                - **GPU 可用**: {torch.cuda.is_available()}
+                - **GPU 数量**: {torch.cuda.device_count() if torch.cuda.is_available() else 0}
+                - **CUDA 版本**: {torch.version.cuda if torch.cuda.is_available() else 'N/A'}
+                
+                ### 📊 模型信息
+                - **模型版本**: {getattr(tts, 'model_version', None) or '1.0'}
+                - **设备**: {getattr(tts, 'device', 'unknown')}
+                - **FP16**: {getattr(tts, 'is_fp16', False)}
+                - **CUDA 内核**: {getattr(tts, 'use_cuda_kernel', False)}
+                
+                ### 🔧 修复状态
+                - **bitsandbytes**: ✅ 已禁用
+                - **DeepSpeed**: ⚠️ 未安装 (自动回退)
+                - **BigVGAN CUDA**: ⚠️ 回退到 torch 实现
+                
+                ### 📋 队列管理
+                - **队列功能**: ✅ 已启用
+                - **并发限制**: 1个任务
+                - **历史统计**: 最近20次执行时间
+                - **时间预估**: 基于历史算力
+                
+                ### 🎭 Demos 功能
+                - **音频分类**: {total_categories}
+                - **总音频数**: {total_files}
+                - **支持格式**: WAV
+                
+                ### 📋 启动参数
+                - **主机**: {cmd_args.host}
+                - **端口**: {cmd_args.port}
+                - **详细模式**: {cmd_args.verbose}
+                - **分享链接**: {cmd_args.share}
+                """)
+    
+    with gr.Tab("🕒 最近生成"):
+        with gr.Row():
+            gr.Markdown("### 🎵 最近生成的音频")
+            refresh_outputs_btn = gr.Button("🔄 刷新列表", variant="secondary")
+        
+        # 最近输出表格
+        recent_outputs_table = gr.Dataframe(
+            headers=["文件名", "生成时间", "大小", "路径"],
+            datatype=["str", "str", "str", "str"],
+            col_count=(4, "fixed"),
+            elem_classes=["recent-outputs"]
         )
-
-    experimental_checkbox.change(
-        on_experimental_change,
-        inputs=[experimental_checkbox, emo_control_method],
-        outputs=[emo_control_method, example_table]
-    )
-
+        
+        # 选中音频播放器
+        selected_output_audio = gr.Audio(
+            label="🎵 选中的音频",
+            visible=False,
+            elem_id="selected_output_audio"
+        )
+        
+        # 事件绑定
+        refresh_outputs_btn.click(
+            refresh_recent_outputs,
+            outputs=[recent_outputs_table, selected_output_audio]
+        )
+        
+        # 表格选择事件
+        def on_table_select(evt: gr.SelectData):
+            """处理表格选择事件"""
+            if evt.index is not None and len(evt.index) >= 2:
+                # 获取选中行的数据
+                outputs = get_recent_outputs()
+                if evt.index[0] < len(outputs):
+                    selected_file = outputs[evt.index[0]]
+                    return gr.update(value=selected_file['path'], visible=True)
+            return gr.update(visible=False)
+        
+        recent_outputs_table.select(
+            on_table_select,
+            outputs=[selected_output_audio]
+        )
+        
+        # 初始加载
+        demo.load(
+            refresh_recent_outputs,
+            outputs=[recent_outputs_table, selected_output_audio]
+        )
+    
+    # 高级参数列表
+    advanced_params = [
+        do_sample, top_p, top_k, temperature,
+        length_penalty, num_beams, repetition_penalty, max_mel_tokens,
+    ]
+    
+    # 事件绑定
     input_text_single.change(
         on_input_text_change,
         inputs=[input_text_single, max_text_tokens_per_segment],
@@ -421,22 +1127,137 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
         inputs=[input_text_single, max_text_tokens_per_segment],
         outputs=[segments_preview]
     )
+    
+    prompt_audio.upload(
+        update_prompt_audio,
+        inputs=[],
+        outputs=[gen_button]
+    )
+    
+    # 清空文本按钮事件绑定
+    clear_text_btn.click(
+        clear_text,
+        inputs=[],
+        outputs=[input_text_single]
+    )
+    
+    # 队列状态刷新
+    refresh_queue_btn.click(
+        refresh_queue_status,
+        inputs=[],
+        outputs=[queue_status_display]
+    )
+    
+    # Demos 相关事件绑定（只有在有demos音频时才绑定）
+    if get_demo_categories():
+        demo_category.change(
+            on_demo_category_change,
+            inputs=[demo_category],
+            outputs=[demo_subcategory]
+        )
+        
+        demo_subcategory.change(
+            on_demo_subcategory_change,
+            inputs=[demo_category, demo_subcategory],
+            outputs=[demo_audio_file]
+        )
+        
+        # 音频文件选择时自动使用该音频
+        demo_audio_file.change(
+            auto_use_demo_audio,
+            inputs=[demo_category, demo_subcategory, demo_audio_file],
+            outputs=[prompt_audio]
+        )
+        
+        # 保留手动使用按钮功能
+        use_demo_btn.click(
+            on_demo_audio_select,
+            inputs=[demo_category, demo_subcategory, demo_audio_file],
+            outputs=[prompt_audio]
+        )
+    
+    # 修改生成按钮事件，使用队列版本
+    gen_button.click(
+        gen_single_with_queue,
+        inputs=[
+            prompt_audio, input_text_single, infer_mode,
+            max_text_tokens_per_segment,
+            *advanced_params,
+        ],
+        outputs=[output_audio, task_status_output]
+    )
+    
+    # 初始化队列状态显示
+    demo.load(
+        refresh_queue_status,
+        inputs=[],
+        outputs=[queue_status_display]
+    )
 
-    prompt_audio.upload(update_prompt_audio,
-                         inputs=[],
-                         outputs=[gen_button])
+def get_system_info():
+    """获取系统信息，包括显存使用情况"""
+    info = {}
+    
+    # 基本系统信息
+    info.update({
+        'python_version': sys.version,
+        'working_directory': os.getcwd(),
+        'model_directory': cmd_args.model_dir,
+        'gpu_available': torch.cuda.is_available(),
+        'gpu_count': torch.cuda.device_count() if torch.cuda.is_available() else 0,
+        'cuda_version': torch.version.cuda if torch.cuda.is_available() else 'N/A'
+    })
+    
+    # 获取显存监控信息
+    if memory_monitor:
+        info.update(memory_monitor.get_memory_info())
+    
+    return info
 
-    gen_button.click(gen_single,
-                     inputs=[emo_control_method,prompt_audio, input_text_single, emo_upload, emo_weight,
-                            vec1, vec2, vec3, vec4, vec5, vec6, vec7, vec8,
-                             emo_text,emo_random,
-                             max_text_tokens_per_segment,
-                             *advanced_params,
-                     ],
-                     outputs=[output_audio])
-
-
+def process_tts_task(text, *args):
+    try:
+        result = original_tts_function(text, *args)
+        # 主动清理
+        memory_monitor.clean_memory()
+        return result
+    except Exception as e:
+        raise e
 
 if __name__ == "__main__":
-    demo.queue(20)
-    demo.launch(server_name=cmd_args.host, server_port=cmd_args.port)
+    print("\n🌐 启动 IndexTTS WebUI (统一版本)...")
+    print(f"   地址: http://{cmd_args.host}:{cmd_args.port}")
+    print(f"   模型目录: {cmd_args.model_dir}")
+    print(f"   详细模式: {cmd_args.verbose}")
+    print(f"   分享链接: {cmd_args.share}")
+    print(f"   队列管理: ✅ 已启用")
+    
+    # 启动显存监控
+    try:
+        memory_monitor.start()
+        print("✅ 显存监控已启动")
+    except Exception as e:
+        print(f"⚠️ 显存监控启动失败: {e}")
+    
+    # 获取demos统计信息
+    total_categories, total_files, _ = get_demos_statistics()
+    print(f"   音频分类: {total_categories}")
+    print(f"   音频文件: {total_files}")
+    print("   按 Ctrl+C 停止服务")
+    print("=" * 50)
+    
+    try:
+        demo.queue(max_size=20)  # 设置队列大小
+        demo.launch(
+            server_name=cmd_args.host,
+            server_port=cmd_args.port,
+            share=cmd_args.share,
+            inbrowser=not cmd_args.share,  # 如果不分享则自动打开浏览器
+            show_error=True
+        )
+    finally:
+        # 停止显存监控
+        if memory_monitor:
+            memory_monitor.stop()
+        # 停止队列处理器
+        task_queue.stop_worker()
+        print("🛑 服务已停止")
