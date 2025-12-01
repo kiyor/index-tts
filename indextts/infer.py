@@ -425,8 +425,20 @@ class IndexTTS:
         all_batch_num = sum(len(s) for s in all_sentences)
         all_batch_codes = []
         processed_num = 0
-        for item_tokens in all_text_tokens:
+        
+        # 调试：检查数据完整性
+        print(f">> Debug: all_text_tokens length: {len(all_text_tokens)}")
+        print(f">> Debug: all_sentences length: {len(all_sentences)}")
+        print(f">> Debug: all_batch_num: {all_batch_num}")
+        
+        for idx, item_tokens in enumerate(all_text_tokens):
             batch_num = len(item_tokens)
+            print(f">> Debug: Processing batch {idx}, batch_num: {batch_num}")
+            
+            if batch_num == 0:
+                print(f">> Warning: Empty batch {idx}, skipping")
+                continue
+                
             if batch_num > 1:
                 batch_text_tokens = self.pad_tokens_cat(item_tokens)
             else:
@@ -458,12 +470,34 @@ class IndexTTS:
         all_idxs = []
         all_latents = []
         has_warned = False
-        for batch_codes, batch_tokens, batch_sentences in zip(all_batch_codes, all_text_tokens, all_sentences):
+        print(f">> Debug: Processing {len(all_batch_codes)} batches")
+        print(f">> Debug: all_batch_codes length: {len(all_batch_codes)}")
+        print(f">> Debug: all_text_tokens length: {len(all_text_tokens)}")
+        print(f">> Debug: all_sentences length: {len(all_sentences)}")
+        
+        # 确保三个列表长度一致
+        min_length = min(len(all_batch_codes), len(all_text_tokens), len(all_sentences))
+        if min_length != len(all_batch_codes):
+            print(f">> Warning: Length mismatch detected, using min_length: {min_length}")
+            
+        for batch_idx in range(min_length):
+            batch_codes = all_batch_codes[batch_idx]
+            batch_tokens = all_text_tokens[batch_idx]
+            batch_sentences = all_sentences[batch_idx]
             # 修复：只处理实际的输入数量，不是autoregressive_batch_size的数量
             actual_batch_size = len(batch_tokens)
+            print(f">> Debug: Batch {batch_idx}: batch_codes.shape={batch_codes.shape}, actual_batch_size={actual_batch_size}")
+            print(f">> Debug: Batch {batch_idx}: sentences={[s['idx'] for s in batch_sentences]}")
             for i in range(actual_batch_size):
-                # 选择第一个生成序列（autoregressive_batch_size可能>1）
-                codes = batch_codes[0] if batch_codes.shape[0] > 1 else batch_codes[i]  # [x]
+                # 选择对应的生成序列（修复重复音频问题）
+                # 每个句子可能生成多个sequence（autoregressive_batch_size），我们取每个句子的第一个
+                codes_idx = i * autoregressive_batch_size if actual_batch_size > 1 else 0
+                if codes_idx >= batch_codes.shape[0]:
+                    codes_idx = 0  # fallback to first sequence
+                codes = batch_codes[codes_idx]  # [x]
+                print(f">> Debug: Processing sentence {i}, using codes index {codes_idx} (batch_size={actual_batch_size}, autoregressive_batch_size={autoregressive_batch_size}), codes hash={hash(codes.cpu().numpy().tobytes())}")
+                print(f">> Debug: Sentence idx={batch_sentences[i]['idx']}, text='{batch_sentences[i]['sent'][:50]}...'")
+                print(f">> Debug: codes shape={codes.shape}, first 10 codes={codes[:10].tolist()}")
                 if not has_warned and codes[-1] != self.stop_mel_token:
                     warnings.warn(
                         f"WARN: generation stopped due to exceeding `max_mel_tokens` ({max_mel_tokens}). "
